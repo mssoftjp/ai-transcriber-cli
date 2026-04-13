@@ -1,0 +1,7 @@
+/transcriber
+dist/
+/testdata/
+coverage.out
+/Recording *.m4a
+.DS_Store
+/.git-backup-*/

@@ -1,0 +1,22 @@
+# Changelog
+
+## Unreleased
+
+- No unreleased changes yet.
+
+## v0.1.1
+
+- Fix GitHub Actions lint execution so CI works correctly with the repository Go version.
+- Package Windows release artifacts as `.zip` archives with a `.exe` binary inside.
+- Keep macOS and Linux release packaging unchanged as `.tar.gz`.
+
+## v0.1.0
+
+- Initial public release of the Go CLI.
+- Add `transcribe`, `probe`, `doctor`, `version`, `config init`, and `config validate`.
+- Support `txt`, `md`, `json`, `srt`, and `vtt` output formats.
+- Add JSONL events, manifest output, dry-run planning, and partial-output handling.
+- Add model-aware planning for `gpt-4o-transcribe`, `gpt-4o-mini-transcribe`, `whisper-1`, `whisper-1-ts`, and diarize-capable transcription.
+- Add ffmpeg/ffprobe-based probing, normalization, trimming, chunking, and local VAD boundary optimization.
+- Add dictionary correction, AI postprocess, and speaker-aware rendering paths.
+- Add release packaging, checksums, local hooks, CI workflows, and improved CLI help for automation wrappers.

@@ -1,0 +1,17 @@
+#!/bin/sh
+
+set -eu
+
+staged_go_files=$(git diff --cached --name-only --diff-filter=ACMR | grep '\.go$' || true)
+if [ -n "$staged_go_files" ]; then
+  unformatted=$(printf '%s\n' "$staged_go_files" | xargs gofmt -l)
+  if [ -n "$unformatted" ]; then
+    echo "Unformatted Go files staged for commit:" >&2
+    printf '%s\n' "$unformatted" >&2
+    echo "Run gofmt before committing." >&2
+    exit 1
+  fi
+fi
+
+echo "Running pre-commit checks: make lint"
+make lint

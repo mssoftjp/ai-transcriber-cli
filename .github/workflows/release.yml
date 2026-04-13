@@ -89,11 +89,37 @@ jobs:
         run: ./scripts/release-notes.sh "${{ github.ref_name }}" dist/release-notes.md
 
       - name: Publish release
-        uses: softprops/action-gh-release@v2
-        with:
-          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-alpha') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-dev') }}
-          body_path: dist/release-notes.md
-          files: |
-            dist/*.tar.gz
-            dist/*.zip
-            dist/checksums.txt
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          prerelease=false
+          case "${{ github.ref_name }}" in
+            *-rc*|*-alpha*|*-beta*|*-dev*)
+              prerelease=true
+              ;;
+          esac
+
+          args=()
+          if [ "$prerelease" = true ]; then
+            args+=(--prerelease)
+          fi
+
+          if gh release view "${{ github.ref_name }}" >/dev/null 2>&1; then
+            gh release edit "${{ github.ref_name }}" \
+              --title "${{ github.ref_name }}" \
+              --notes-file dist/release-notes.md \
+              "${args[@]}"
+          else
+            gh release create "${{ github.ref_name }}" \
+              --title "${{ github.ref_name }}" \
+              --notes-file dist/release-notes.md \
+              "${args[@]}"
+          fi
+
+          gh release upload "${{ github.ref_name }}" \
+            dist/*.tar.gz \
+            dist/*.zip \
+            dist/checksums.txt \
+            --clobber

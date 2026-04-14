@@ -9,6 +9,7 @@ type ModelProfile struct {
 	SupportsTimestampOutput  bool
 	SupportsDiarization      bool
 	SupportsServerChunking   bool
+	UseOverlapMergeV2        bool
 	ParallelChunking         bool
 	PromptCarryover          bool
 	ChunkTargetSec           float64
@@ -24,6 +25,7 @@ var transcriptionModelProfiles = map[string]ModelProfile{
 		SupportsTimestampOutput: false,
 		SupportsDiarization:     false,
 		SupportsServerChunking:  true,
+		UseOverlapMergeV2:       true,
 		ParallelChunking:        false,
 		PromptCarryover:         true,
 		ChunkTargetSec:          300,
@@ -39,6 +41,7 @@ var transcriptionModelProfiles = map[string]ModelProfile{
 		SupportsTimestampOutput: false,
 		SupportsDiarization:     false,
 		SupportsServerChunking:  true,
+		UseOverlapMergeV2:       true,
 		ParallelChunking:        false,
 		PromptCarryover:         true,
 		ChunkTargetSec:          240,
@@ -54,6 +57,7 @@ var transcriptionModelProfiles = map[string]ModelProfile{
 		SupportsTimestampOutput: true,
 		SupportsDiarization:     false,
 		SupportsServerChunking:  false,
+		UseOverlapMergeV2:       false,
 		ParallelChunking:        true,
 		PromptCarryover:         false,
 		ChunkTargetSec:          25,
@@ -73,6 +77,7 @@ var transcriptionModelProfiles = map[string]ModelProfile{
 		SupportsTimestampOutput: true,
 		SupportsDiarization:     false,
 		SupportsServerChunking:  false,
+		UseOverlapMergeV2:       false,
 		ParallelChunking:        true,
 		PromptCarryover:         false,
 		ChunkTargetSec:          25,
@@ -92,6 +97,7 @@ var transcriptionModelProfiles = map[string]ModelProfile{
 		SupportsTimestampOutput: true,
 		SupportsDiarization:     true,
 		SupportsServerChunking:  true,
+		UseOverlapMergeV2:       false,
 		ParallelChunking:        false,
 		PromptCarryover:         false,
 		ChunkTargetSec:          300,

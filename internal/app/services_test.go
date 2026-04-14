@@ -637,6 +637,73 @@ func TestTranscribeRespectsOverwriteForManifestAndRawProviderJSON(t *testing.T) 
 	}
 }
 
+func TestTranscribeWritesMergeDiagnosticsToManifest(t *testing.T) {
+	t.Parallel()
+
+	tempDir := t.TempDir()
+	outputPath := filepath.Join(tempDir, "out.json")
+	manifestPath := filepath.Join(tempDir, "out.manifest.json")
+	spec := domain.JobSpec{
+		JobID:         "job-merge-diagnostics",
+		InputPath:     filepath.Join(tempDir, "input.mp3"),
+		OutputPath:    outputPath,
+		Format:        domain.FormatJSON,
+		Model:         "gpt-4o-mini-transcribe",
+		ChunkingMode:  domain.ChunkingClient,
+		Overwrite:     true,
+		WriteManifest: true,
+	}
+	execPlan := plan.ExecutionPlan{
+		ChunkingMode:   domain.ChunkingClient,
+		ResponseFormat: "json",
+		Artifacts: []domain.Artifact{{
+			Path:         outputPath,
+			Format:       domain.FormatJSON,
+			ManifestPath: manifestPath,
+		}},
+		Chunks: []domain.ChunkPlan{
+			{Index: 0, StartSec: 0, EndSec: 60, OverlapSec: 30, PromptCarryover: true},
+			{Index: 1, StartSec: 30, EndSec: 90, OverlapSec: 30, PromptCarryover: true},
+		},
+	}
+	svc := New(
+		stubMediaService{
+			input:  domain.InputInfo{Path: spec.InputPath, SizeBytes: 30 << 20, DurationSec: 570, HasAudio: true},
+			chunks: []string{filepath.Join(tempDir, "chunk-0.wav"), filepath.Join(tempDir, "chunk-1.wav")},
+		},
+		stubPlanner{execPlan: execPlan},
+		&sequenceProvider{
+			responses: []domain.ProviderResponse{
+				{Transcript: domain.Transcript{Version: domain.SchemaVersion, ModelUsed: "gpt-4o-mini-transcribe", Language: "ja", Text: "本日は健康づくりの話をします。大阪に行くので、今後大阪府において健康づくりを広げます。"}},
+				{Transcript: domain.Transcript{Version: domain.SchemaVersion, ModelUsed: "gpt-4o-mini-transcribe", Language: "ja", Text: "その中で大阪に行くので、今後大阪府において健康づくりを広げます。次にフレイル予防の話に進みます。"}},
+			},
+		},
+		passthroughOptimizer{},
+		noopPostprocessor{},
+		testLogger(),
+		events.NopWriter{},
+	)
+
+	if _, _, err := svc.Transcribe(context.Background(), spec); err != nil {
+		t.Fatalf("Transcribe() error = %v", err)
+	}
+
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%s) error = %v", manifestPath, err)
+	}
+	var manifest domain.Manifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		t.Fatalf("manifest JSON error = %v", err)
+	}
+	if len(manifest.MergeDiagnostics) != 1 {
+		t.Fatalf("expected one merge diagnostic, got %#v", manifest.MergeDiagnostics)
+	}
+	if manifest.MergeDiagnostics[0].Strategy != "v2_trigram" {
+		t.Fatalf("expected v2_trigram merge strategy, got %#v", manifest.MergeDiagnostics[0])
+	}
+}
+
 func TestTranscribeEmitsChunkPreparationWarnings(t *testing.T) {
 	t.Parallel()
 

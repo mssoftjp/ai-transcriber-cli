@@ -2,54 +2,63 @@ package merge
 
 import (
 	"sort"
+	"strconv"
 	"strings"
 	"unicode"
 
 	"ai-transcriber-cli/internal/domain"
 )
 
-func Merge(model string, chunks []domain.Transcript, offsets []float64) domain.Transcript {
+type Result struct {
+	Transcript  domain.Transcript
+	Diagnostics []domain.MergeBoundaryDiagnostic
+}
+
+func Merge(model string, chunks []domain.Transcript, plans []domain.ChunkPlan) Result {
 	if len(chunks) == 0 {
-		return domain.Transcript{Version: domain.SchemaVersion}
+		return Result{Transcript: domain.Transcript{Version: domain.SchemaVersion}}
 	}
+
 	merged := chunks[0]
 	merged.Version = domain.SchemaVersion
-	if len(offsets) > 0 {
-		for i := range merged.Segments {
-			merged.Segments[i].StartSec += offsets[0]
-			merged.Segments[i].EndSec += offsets[0]
-		}
-		for i := range merged.Words {
-			merged.Words[i].StartSec += offsets[0]
-			merged.Words[i].EndSec += offsets[0]
-		}
-	}
+	firstPlan := chunkPlanAt(plans, 0)
+	applyTimingOffset(&merged, firstPlan.StartSec)
+
 	speakerSet := make(map[string]struct{}, len(merged.Speakers))
 	for _, speaker := range merged.Speakers {
 		speakerSet[speaker] = struct{}{}
 	}
+
+	profile, _ := domain.ModelProfileFor(model)
+	diagnostics := make([]domain.MergeBoundaryDiagnostic, 0, max(0, len(chunks)-1))
 	for i := 1; i < len(chunks); i++ {
 		next := chunks[i]
-		text, warning := mergeText(merged.Text, next.Text)
+		currentPlan := chunkPlanAt(plans, i)
+		prevPlan := chunkPlanAt(plans, i-1)
+
+		var (
+			text       string
+			warning    *domain.Warning
+			diagnostic domain.MergeBoundaryDiagnostic
+		)
+		if profile.UseOverlapMergeV2 {
+			text, warning, diagnostic = mergeTextV2(merged.Text, next.Text, prevPlan, currentPlan)
+		} else {
+			text, warning, diagnostic = mergeTextLegacy(merged.Text, next.Text, i-1, prevPlan, currentPlan)
+		}
 		merged.Text = text
 		if warning != nil {
 			merged.Warnings = domain.AppendWarning(merged.Warnings, *warning)
 		}
+		diagnostics = append(diagnostics, diagnostic)
+
 		merged.Usage = merged.Usage.Add(next.Usage)
-		if next.DurationSec+offsets[i] > merged.DurationSec {
-			merged.DurationSec = next.DurationSec + offsets[i]
+		if next.DurationSec+currentPlan.StartSec > merged.DurationSec {
+			merged.DurationSec = next.DurationSec + currentPlan.StartSec
 		}
 		merged.Partial = merged.Partial || next.Partial
-		for _, seg := range next.Segments {
-			seg.StartSec += offsets[i]
-			seg.EndSec += offsets[i]
-			merged.Segments = append(merged.Segments, seg)
-		}
-		for _, word := range next.Words {
-			word.StartSec += offsets[i]
-			word.EndSec += offsets[i]
-			merged.Words = append(merged.Words, word)
-		}
+		appendShiftedSegments(&merged, next.Segments, currentPlan.StartSec)
+		appendShiftedWords(&merged, next.Words, currentPlan.StartSec)
 		for _, speaker := range next.Speakers {
 			if _, ok := speakerSet[speaker]; ok {
 				continue
@@ -59,6 +68,7 @@ func Merge(model string, chunks []domain.Transcript, offsets []float64) domain.T
 		}
 		merged.Warnings = append(merged.Warnings, next.Warnings...)
 	}
+
 	merged.Segments = sortAndDedupeSegments(merged.Segments)
 	merged.Words = sortAndDedupeWords(merged.Words)
 	if merged.Text == "" && len(merged.Segments) > 0 {
@@ -69,18 +79,25 @@ func Merge(model string, chunks []domain.Transcript, offsets []float64) domain.T
 		merged.Text = strings.Join(texts, " ")
 	}
 	merged.Warnings = domain.DedupeWarnings(merged.Warnings)
-	return merged
+
+	return Result{Transcript: merged, Diagnostics: diagnostics}
 }
 
-func mergeText(left, right string) (string, *domain.Warning) {
+func mergeTextLegacy(left, right string, boundaryIndex int, leftPlan, rightPlan domain.ChunkPlan) (string, *domain.Warning, domain.MergeBoundaryDiagnostic) {
 	left = strings.TrimSpace(left)
 	right = strings.TrimSpace(right)
+	diagnostic := newDiagnostic(boundaryIndex, leftPlan, rightPlan)
+	diagnostic.Strategy = "legacy"
+
 	if left == "" {
-		return right, nil
+		diagnostic.Strategy = "left_empty"
+		return right, nil, diagnostic
 	}
 	if right == "" {
-		return left, nil
+		diagnostic.Strategy = "right_empty"
+		return left, nil, diagnostic
 	}
+
 	leftRunes := []rune(left)
 	rightRunes := []rune(right)
 	suffixRunes := leftRunes
@@ -91,28 +108,106 @@ func mergeText(left, right string) (string, *domain.Warning) {
 	if len(prefixRunes) > 300 {
 		prefixRunes = prefixRunes[:300]
 	}
+
 	best := 0
-	max := min(len(suffixRunes), len(prefixRunes))
-	for i := 12; i <= max; i++ {
+	maxRunes := min(len(suffixRunes), len(prefixRunes))
+	for i := 12; i <= maxRunes; i++ {
 		if string(suffixRunes[len(suffixRunes)-i:]) == string(prefixRunes[:i]) {
 			best = i
 		}
 	}
 	if best > 0 {
-		return string(leftRunes) + string(rightRunes[best:]), nil
+		diagnostic.Strategy = "legacy_exact"
+		diagnostic.CandidateCount = 1
+		diagnostic.ChosenCutRune = best
+		return string(leftRunes) + string(rightRunes[best:]), nil, diagnostic
 	}
-	for i := 12; i <= max; i++ {
+
+	for i := 12; i <= maxRunes; i++ {
 		if normalize(string(suffixRunes[len(suffixRunes)-i:])) == normalize(string(prefixRunes[:i])) {
 			best = i
 		}
 	}
 	if best > 0 {
-		return string(leftRunes) + string(rightRunes[best:]), nil
+		diagnostic.Strategy = "legacy_normalized"
+		diagnostic.CandidateCount = 1
+		diagnostic.ChosenCutRune = best
+		return string(leftRunes) + string(rightRunes[best:]), nil, diagnostic
 	}
-	return left + "\n\n" + right, &domain.Warning{
+
+	diagnostic.Strategy = "legacy_fallback"
+	diagnostic.FallbackUsed = true
+	return left + "\n\n" + right, unresolvedWarning(boundaryIndex), diagnostic
+}
+
+func applyTimingOffset(transcript *domain.Transcript, offset float64) {
+	if offset == 0 {
+		return
+	}
+	for i := range transcript.Segments {
+		transcript.Segments[i].StartSec += offset
+		transcript.Segments[i].EndSec += offset
+	}
+	for i := range transcript.Words {
+		transcript.Words[i].StartSec += offset
+		transcript.Words[i].EndSec += offset
+	}
+}
+
+func appendShiftedSegments(merged *domain.Transcript, segments []domain.Segment, offset float64) {
+	for _, seg := range segments {
+		seg.StartSec += offset
+		seg.EndSec += offset
+		merged.Segments = append(merged.Segments, seg)
+	}
+}
+
+func appendShiftedWords(merged *domain.Transcript, words []domain.WordTiming, offset float64) {
+	for _, word := range words {
+		word.StartSec += offset
+		word.EndSec += offset
+		merged.Words = append(merged.Words, word)
+	}
+}
+
+func unresolvedWarning(boundaryIndex int) *domain.Warning {
+	return &domain.Warning{
 		Code:    "merge_overlap_unresolved",
-		Message: "chunk overlap could not be resolved cleanly; transcript was joined conservatively",
+		Message: "chunk overlap at boundary " + formatBoundary(boundaryIndex) + " could not be resolved cleanly; transcript was joined conservatively",
 	}
+}
+
+func formatBoundary(boundaryIndex int) string {
+	return strings.Join([]string{itoa(boundaryIndex), "->", itoa(boundaryIndex + 1)}, "")
+}
+
+func itoa(v int) string {
+	return strconv.Itoa(v)
+}
+
+func chunkPlanAt(plans []domain.ChunkPlan, index int) domain.ChunkPlan {
+	if index >= 0 && index < len(plans) {
+		return plans[index]
+	}
+	return domain.ChunkPlan{Index: index}
+}
+
+func newDiagnostic(boundaryIndex int, leftPlan, rightPlan domain.ChunkPlan) domain.MergeBoundaryDiagnostic {
+	return domain.MergeBoundaryDiagnostic{
+		BoundaryIndex:    boundaryIndex,
+		LeftChunkIndex:   leftPlan.Index,
+		RightChunkIndex:  rightPlan.Index,
+		OverlapSec:       rightPlan.OverlapSec,
+		LeftDurationSec:  chunkDuration(leftPlan),
+		RightDurationSec: chunkDuration(rightPlan),
+	}
+}
+
+func chunkDuration(plan domain.ChunkPlan) float64 {
+	if plan.EndSec <= plan.StartSec {
+		return 0
+	}
+	return plan.EndSec - plan.StartSec
 }
 
 func sortAndDedupeSegments(segments []domain.Segment) []domain.Segment {

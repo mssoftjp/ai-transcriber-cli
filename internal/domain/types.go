@@ -80,6 +80,28 @@ type Warning struct {
 	Message string `json:"message"`
 }
 
+type MergeBoundaryDiagnostic struct {
+	BoundaryIndex         int     `json:"boundary_index"`
+	LeftChunkIndex        int     `json:"left_chunk_index"`
+	RightChunkIndex       int     `json:"right_chunk_index"`
+	Strategy              string  `json:"strategy"`
+	OverlapSec            float64 `json:"overlap_sec"`
+	LeftDurationSec       float64 `json:"left_duration_sec"`
+	RightDurationSec      float64 `json:"right_duration_sec"`
+	EstimatedOverlapRunes int     `json:"estimated_overlap_runes"`
+	LeftTailRunes         int     `json:"left_tail_runes"`
+	LocalWindowRunes      int     `json:"local_window_runes,omitempty"`
+	SearchWindowStartRune int     `json:"search_window_start_rune"`
+	SearchWindowEndRune   int     `json:"search_window_end_rune"`
+	CandidateCount        int     `json:"candidate_count"`
+	ChosenCutRune         int     `json:"chosen_cut_rune,omitempty"`
+	OverlapScore          float64 `json:"overlap_score,omitempty"`
+	NoveltyScore          float64 `json:"novelty_score,omitempty"`
+	CombinedScore         float64 `json:"combined_score,omitempty"`
+	ScoreGap              float64 `json:"score_gap,omitempty"`
+	FallbackUsed          bool    `json:"fallback_used"`
+}
+
 type ChunkPlan struct {
 	Index           int     `json:"index"`
 	StartSec        float64 `json:"start_sec"`
@@ -148,13 +170,14 @@ type InputInfo struct {
 }
 
 type Manifest struct {
-	Version   string      `json:"version"`
-	JobID     string      `json:"job_id"`
-	Input     InputInfo   `json:"input"`
-	Plan      PlanSummary `json:"plan"`
-	Artifacts []Artifact  `json:"artifacts,omitempty"`
-	TimingsMS Timings     `json:"timings_ms"`
-	Warnings  []Warning   `json:"warnings,omitempty"`
+	Version          string                    `json:"version"`
+	JobID            string                    `json:"job_id"`
+	Input            InputInfo                 `json:"input"`
+	Plan             PlanSummary               `json:"plan"`
+	Artifacts        []Artifact                `json:"artifacts,omitempty"`
+	TimingsMS        Timings                   `json:"timings_ms"`
+	Warnings         []Warning                 `json:"warnings,omitempty"`
+	MergeDiagnostics []MergeBoundaryDiagnostic `json:"merge_diagnostics,omitempty"`
 }
 
 type PlanSummary struct {
@@ -249,6 +272,8 @@ type JobSpec struct {
 	ServerVADThreshold                float64
 	ServerVADPrefixMS                 int
 	ServerVADSilenceMS                int
+	ChunkTargetSecOverride            *float64
+	ChunkOverlapSecOverride           *float64
 	SpeakerRefs                       []SpeakerReference
 }
 

@@ -181,3 +181,63 @@ func TestPlannerRequiresFFmpegForProviderIncompatibleAudioExtension(t *testing.T
 		t.Fatal("expected ffmpeg to be required for provider-incompatible extension")
 	}
 }
+
+func TestPlannerAppliesChunkOverrideFlags(t *testing.T) {
+	planner := NewPlanner()
+	target := 150.0
+	overlap := 30.0
+	execPlan, err := planner.Build(domain.JobSpec{
+		InputPath:               "/tmp/input.mp3",
+		Format:                  domain.FormatJSON,
+		Model:                   "gpt-4o-mini-transcribe",
+		ChunkingMode:            domain.ChunkingClient,
+		ChunkTargetSecOverride:  &target,
+		ChunkOverlapSecOverride: &overlap,
+	}, domain.InputInfo{
+		Path:        "/tmp/input.mp3",
+		SizeBytes:   30 * 1024 * 1024,
+		DurationSec: 360,
+		HasAudio:    true,
+	})
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	if len(execPlan.Chunks) < 2 {
+		t.Fatalf("expected multiple chunks, got %#v", execPlan.Chunks)
+	}
+	if execPlan.Chunks[0].EndSec != 150 || execPlan.Chunks[1].StartSec != 120 {
+		t.Fatalf("unexpected chunk plan: %#v", execPlan.Chunks[:2])
+	}
+}
+
+func TestPlannerUsesTrimmedDurationForChunkPlanning(t *testing.T) {
+	planner := NewPlanner()
+	start := 0.0
+	end := 1200.0
+	target := 150.0
+	overlap := 30.0
+	execPlan, err := planner.Build(domain.JobSpec{
+		InputPath:               "/tmp/input.mp3",
+		Format:                  domain.FormatJSON,
+		Model:                   "gpt-4o-mini-transcribe",
+		ChunkingMode:            domain.ChunkingClient,
+		StartSec:                &start,
+		EndSec:                  &end,
+		ChunkTargetSecOverride:  &target,
+		ChunkOverlapSecOverride: &overlap,
+	}, domain.InputInfo{
+		Path:        "/tmp/input.mp3",
+		SizeBytes:   30 * 1024 * 1024,
+		DurationSec: 4553.96,
+		HasAudio:    true,
+	})
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	if execPlan.Input.DurationSec != 1200 {
+		t.Fatalf("expected trimmed duration of 1200s, got %f", execPlan.Input.DurationSec)
+	}
+	if len(execPlan.Chunks) != 10 {
+		t.Fatalf("expected 10 chunks for 1200s at 150/30, got %d", len(execPlan.Chunks))
+	}
+}

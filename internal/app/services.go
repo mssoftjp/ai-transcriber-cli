@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -217,7 +218,7 @@ func (s *Services) Transcribe(ctx context.Context, spec domain.JobSpec) (artifac
 	}
 
 	var transcripts []domain.Transcript
-	var offsets []float64
+	var mergePlans []domain.ChunkPlan
 	var rawJSONs []string
 	var runtimeWarnings []domain.Warning
 	knownSpeakerNames := speakerReferenceNames(spec.SpeakerRefs)
@@ -255,7 +256,7 @@ func (s *Services) Transcribe(ctx context.Context, spec domain.JobSpec) (artifac
 		_ = s.Events.Emit("stage.started", map[string]any{"stage": domain.StageTranscribing, "message": "transcribing chunks"})
 		transcribeStarted := time.Now()
 		transcripts = make([]domain.Transcript, len(chunkPaths))
-		offsets = make([]float64, len(chunkPaths))
+		mergePlans = slices.Clone(chunkPlan)
 		rawJSONs = make([]string, len(chunkPaths))
 		if isWhisperParallel(spec) {
 			var (
@@ -291,7 +292,6 @@ func (s *Services) Transcribe(ctx context.Context, spec domain.JobSpec) (artifac
 						AllowExperimentalStitching: spec.AllowExperimentalDiarizeStitching,
 						KnownSpeakerNames:          knownSpeakerNames,
 					}, resp.Transcript)
-					offsets[i] = chunkPlan[i].StartSec
 					rawJSONs[i] = resp.RawJSON
 					okChunks[i] = true
 					completed++
@@ -307,8 +307,8 @@ func (s *Services) Transcribe(ctx context.Context, spec domain.JobSpec) (artifac
 			}
 			wg.Wait()
 			if firstErr != nil {
-				filteredTranscripts, filteredOffsets := filterSuccessfulChunks(transcripts, offsets)
-				return s.handlePartial(ctx, spec, filteredTranscripts, filteredOffsets, execPlan, timings, firstErr)
+				filteredTranscripts, filteredPlans := filterSuccessfulChunks(transcripts, mergePlans)
+				return s.handlePartial(ctx, spec, filteredTranscripts, filteredPlans, execPlan, timings, firstErr)
 			}
 		} else {
 			for i, chunkPath := range chunkPaths {
@@ -323,7 +323,7 @@ func (s *Services) Transcribe(ctx context.Context, spec domain.JobSpec) (artifac
 					ResponseFormat: execPlan.ResponseFormat,
 				})
 				if transcribeErr != nil {
-					return s.handlePartial(ctx, spec, transcripts[:i], offsets[:i], execPlan, timings, transcribeErr)
+					return s.handlePartial(ctx, spec, transcripts[:i], mergePlans[:i], execPlan, timings, transcribeErr)
 				}
 				_ = s.Events.Emit("chunk.completed", map[string]any{"chunk_index": i})
 				transcripts[i] = merge.PrepareChunkTranscript(merge.ChunkPreparationOptions{
@@ -333,7 +333,6 @@ func (s *Services) Transcribe(ctx context.Context, spec domain.JobSpec) (artifac
 					AllowExperimentalStitching: spec.AllowExperimentalDiarizeStitching,
 					KnownSpeakerNames:          knownSpeakerNames,
 				}, resp.Transcript)
-				offsets[i] = chunkPlan[i].StartSec
 				rawJSONs[i] = resp.RawJSON
 				_ = s.Events.Emit("stage.progress", map[string]any{
 					"stage":         domain.StageTranscribing,
@@ -371,13 +370,19 @@ func (s *Services) Transcribe(ctx context.Context, spec domain.JobSpec) (artifac
 			return nil, nil, err
 		}
 		transcripts = append(transcripts, resp.Transcript)
-		offsets = append(offsets, 0)
+		mergePlans = append(mergePlans, domain.ChunkPlan{
+			Index:      0,
+			StartSec:   0,
+			EndSec:     execPlan.Input.DurationSec,
+			OverlapSec: 0,
+		})
 		rawJSONs = append(rawJSONs, resp.RawJSON)
 	}
 
 	_ = s.Events.Emit("stage.started", map[string]any{"stage": domain.StageMerging, "message": "merging results"})
 	mergeStarted := time.Now()
-	transcript := merge.Merge(spec.Model, transcripts, offsets)
+	mergeResult := merge.Merge(spec.Model, transcripts, mergePlans)
+	transcript := mergeResult.Transcript
 	if transcript.DurationSec == 0 && execPlan.Input.DurationSec > 0 {
 		transcript.DurationSec = execPlan.Input.DurationSec
 	}
@@ -453,13 +458,14 @@ func (s *Services) Transcribe(ctx context.Context, spec domain.JobSpec) (artifac
 	timings.Write = time.Since(writeStarted).Milliseconds()
 	if spec.WriteManifest && len(artifacts) > 0 {
 		manifest := domain.Manifest{
-			Version:   domain.SchemaVersion,
-			JobID:     spec.JobID,
-			Input:     execPlan.Input,
-			Plan:      domain.PlanSummary{ChunkingMode: execPlan.ChunkingMode, Model: spec.Model, Language: spec.Language},
-			Artifacts: artifacts,
-			TimingsMS: timings,
-			Warnings:  transcript.Warnings,
+			Version:          domain.SchemaVersion,
+			JobID:            spec.JobID,
+			Input:            execPlan.Input,
+			Plan:             domain.PlanSummary{ChunkingMode: execPlan.ChunkingMode, Model: spec.Model, Language: spec.Language},
+			Artifacts:        artifacts,
+			TimingsMS:        timings,
+			Warnings:         transcript.Warnings,
+			MergeDiagnostics: mergeResult.Diagnostics,
 		}
 		manifestData, _ := json.MarshalIndent(manifest, "", "  ")
 		if writeErr := fs.WriteFile(artifacts[0].ManifestPath, manifestData, spec.Overwrite); writeErr != nil {
@@ -508,12 +514,12 @@ func joinPrompt(parts ...string) string {
 	return strings.Join(out, "\n\n")
 }
 
-func (s *Services) handlePartial(ctx context.Context, spec domain.JobSpec, transcripts []domain.Transcript, offsets []float64, execPlan plan.ExecutionPlan, _ domain.Timings, cause error) ([]domain.Artifact, []byte, error) {
+func (s *Services) handlePartial(ctx context.Context, spec domain.JobSpec, transcripts []domain.Transcript, mergePlans []domain.ChunkPlan, execPlan plan.ExecutionPlan, _ domain.Timings, cause error) ([]domain.Artifact, []byte, error) {
 	if len(transcripts) == 0 || spec.PartialOutput == domain.PartialDiscard {
 		_ = s.emitFailure(ctx, cause)
 		return nil, nil, cause
 	}
-	transcript := merge.Merge(spec.Model, transcripts, offsets)
+	transcript := merge.Merge(spec.Model, transcripts, mergePlans).Transcript
 	transcript.Partial = true
 	rendered, err := render.Transcript(render.RenderInput{
 		Transcript:   transcript,
@@ -565,17 +571,19 @@ func isWhisperParallel(spec domain.JobSpec) bool {
 	return ok && profile.ParallelChunking
 }
 
-func filterSuccessfulChunks(transcripts []domain.Transcript, offsets []float64) ([]domain.Transcript, []float64) {
+func filterSuccessfulChunks(transcripts []domain.Transcript, plans []domain.ChunkPlan) ([]domain.Transcript, []domain.ChunkPlan) {
 	filteredTranscripts := make([]domain.Transcript, 0, len(transcripts))
-	filteredOffsets := make([]float64, 0, len(offsets))
+	filteredPlans := make([]domain.ChunkPlan, 0, len(plans))
 	for i := range transcripts {
 		if strings.TrimSpace(transcripts[i].Text) == "" && len(transcripts[i].Segments) == 0 {
 			continue
 		}
 		filteredTranscripts = append(filteredTranscripts, transcripts[i])
-		filteredOffsets = append(filteredOffsets, offsets[i])
+		if i < len(plans) {
+			filteredPlans = append(filteredPlans, plans[i])
+		}
 	}
-	return filteredTranscripts, filteredOffsets
+	return filteredTranscripts, filteredPlans
 }
 
 func marshalRawProviderJSON(rawJSONs []string) []byte {

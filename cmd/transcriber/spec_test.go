@@ -146,3 +146,27 @@ func TestBuildSpecRejectsMalformedSpeakerRef(t *testing.T) {
 		t.Fatalf("unexpected error code: %s", code)
 	}
 }
+
+func TestBuildSpecCarriesChunkOverrides(t *testing.T) {
+	cfg := config.Default()
+
+	cmd := &cobra.Command{Use: "transcribe"}
+	addCommonTranscribeFlags(cmd)
+	if err := cmd.Flags().Set("chunk-target-sec", "150"); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Flags().Set("chunk-overlap-sec", "30"); err != nil {
+		t.Fatal(err)
+	}
+
+	spec, err := buildSpec(cfg, cmd, "/tmp/input.mp3")
+	if err != nil {
+		t.Fatalf("buildSpec() error = %v", err)
+	}
+	if spec.ChunkTargetSecOverride == nil || *spec.ChunkTargetSecOverride != 150 {
+		t.Fatalf("expected chunk target override, got %#v", spec.ChunkTargetSecOverride)
+	}
+	if spec.ChunkOverlapSecOverride == nil || *spec.ChunkOverlapSecOverride != 30 {
+		t.Fatalf("expected chunk overlap override, got %#v", spec.ChunkOverlapSecOverride)
+	}
+}

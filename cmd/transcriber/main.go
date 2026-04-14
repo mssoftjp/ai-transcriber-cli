@@ -442,6 +442,8 @@ func addCommonTranscribeFlags(cmd *cobra.Command) {
 	cmd.Flags().Bool("diarize", false, "shorthand for --model gpt-4o-transcribe-diarize")
 	cmd.Flags().String("chunking-mode", "", "chunking mode: auto, off, server-auto, server-vad, client")
 	cmd.Flags().String("vad-mode", "", "VAD mode: disabled, local")
+	cmd.Flags().Float64("chunk-target-sec", 0, "advanced override for client chunk target length in seconds")
+	cmd.Flags().Float64("chunk-overlap-sec", 0, "advanced override for client chunk overlap in seconds")
 	cmd.Flags().Float64("server-vad-threshold", 0.0, "server VAD threshold override")
 	cmd.Flags().Int("server-vad-prefix-ms", 0, "server VAD prefix padding override in milliseconds")
 	cmd.Flags().Int("server-vad-silence-ms", 0, "server VAD silence duration override in milliseconds")
@@ -529,6 +531,14 @@ func buildSpec(cfg config.AppConfig, cmd *cobra.Command, input string) (domain.J
 		ServerVADSilenceMS:                firstInt(getInt(cmd, "server-vad-silence-ms"), cfg.ServerVAD.SilenceDurationMS),
 		SpeakerRefs:                       speakerRefs,
 	}
+	if cmd.Flags().Changed("chunk-target-sec") {
+		value := getFloat(cmd, "chunk-target-sec")
+		spec.ChunkTargetSecOverride = &value
+	}
+	if cmd.Flags().Changed("chunk-overlap-sec") {
+		value := getFloat(cmd, "chunk-overlap-sec")
+		spec.ChunkOverlapSecOverride = &value
+	}
 	if obsidianMode := getString(cmd, "obsidian-vad-mode"); obsidianMode != "" {
 		switch obsidianMode {
 		case "server":
@@ -569,6 +579,9 @@ func buildSpec(cfg config.AppConfig, cmd *cobra.Command, input string) (domain.J
 	}
 	if spec.EndSec, err = parseOptionalTime(getString(cmd, "end")); err != nil {
 		return domain.JobSpec{}, domain.NewError("end_invalid", "invalid --end value", domain.ExitArgs, err)
+	}
+	if spec.StartSec != nil && spec.EndSec != nil && *spec.EndSec <= *spec.StartSec {
+		return domain.JobSpec{}, domain.NewError("time_range_invalid", "--end must be greater than --start", domain.ExitArgs, nil)
 	}
 	return spec, nil
 }

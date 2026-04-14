@@ -152,6 +152,7 @@ These examples are intentionally small. They show the payload shape that automat
 - `--events jsonl` writes progress events to stdout
 - `--stdout` and `--events jsonl` are mutually exclusive
 - `--partial-output` controls failure behavior: `write`, `discard`, or `stdout`
+- `--resume` reuses completed client-side chunks from the existing manifest sidecar and chunk cache
 
 ## Event Contract
 
@@ -194,6 +195,7 @@ Failure-oriented automation should also expect:
 - `job.failed` with `code` and `message`
 - `job.partial` when partial output is produced
 - `job.cancelled` on cancellation
+- resumable manifests for client-chunked jobs may include `resume_capable`, `chunk_cache_dir`, and `chunks`
 
 ## Exit Codes
 
@@ -220,3 +222,4 @@ Failure-oriented automation should also expect:
 - `logprobs` is supported only by `gpt-4o-transcribe` and `gpt-4o-mini-transcribe`
 - `probe` does not upload audio and is intended as the safe planning step for automation
 - `transcribe --dry-run` returns planning data without calling the provider
+- `--resume` is supported only for client-chunked transcription jobs that wrote a manifest in an earlier partial run

@@ -2,7 +2,8 @@
 
 ## Unreleased
 
-- No unreleased changes yet.
+- Add resumable client-chunked transcription via manifest-backed chunk caches.
+- Default `--retries` to `1` for retryable provider failures and reset input streams correctly before retry.
 
 ## v0.2.0
 

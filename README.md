@@ -76,6 +76,8 @@ By default, the output file is written next to the input as `<name>.transcript.m
 
 Supported input formats include `.mp3`, `.m4a`, `.wav`, `.flac`, `.ogg`, `.mp4`, `.mov`, `.mkv`, and others. Run `transcriber transcribe --help` for the full list. Long files are automatically split into chunks and reassembled.
 
+If a long client-chunked job fails partway through, re-run the same command with `--resume` to reuse completed chunks from the manifest sidecar and chunk cache next to the output artifacts.
+
 ## Choosing a Model
 
 | Model | Strengths | Good for |

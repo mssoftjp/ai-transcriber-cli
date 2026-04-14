@@ -74,6 +74,11 @@ func (p *Provider) Transcribe(ctx context.Context, req domain.ProviderRequest) (
 	var lastErr error
 	attempts := req.Spec.Retries + 1
 	for attempt := 0; attempt < attempts; attempt++ {
+		if attempt > 0 {
+			if _, err := file.Seek(0, 0); err != nil {
+				return domain.ProviderResponse{}, domain.NewError("input_seek_failed", "failed to reset input for retry", domain.ExitInput, err)
+			}
+		}
 		resp, err := p.client.Audio.Transcriptions.New(ctx, params)
 		if err == nil {
 			return normalizeResponse(resp, req.Spec.Model), nil

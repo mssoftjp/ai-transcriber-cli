@@ -202,6 +202,15 @@ func (s *Services) Transcribe(ctx context.Context, spec domain.JobSpec) (artifac
 		data, _ := json.MarshalIndent(map[string]any{"probe": probe, "plan": execPlan}, "", "  ")
 		return nil, data, nil
 	}
+	outputArtifacts := execPlan.Artifacts
+	if len(outputArtifacts) == 0 {
+		outputArtifacts = plan.BuildArtifacts(spec)
+	}
+	if spec.Resume && execPlan.ChunkingMode != domain.ChunkingClient {
+		err = domain.NewError("resume_chunking_mode_invalid", "resume is supported only for client-side chunking jobs", domain.ExitInput, nil)
+		_ = s.emitFailure(ctx, err)
+		return nil, nil, err
+	}
 
 	workdir := spec.Workdir
 	if workdir == "" {
@@ -221,6 +230,7 @@ func (s *Services) Transcribe(ctx context.Context, spec domain.JobSpec) (artifac
 	var mergePlans []domain.ChunkPlan
 	var rawJSONs []string
 	var runtimeWarnings []domain.Warning
+	var resumeStore *chunkResumeStore
 	knownSpeakerNames := speakerReferenceNames(spec.SpeakerRefs)
 	if execPlan.ChunkingMode == domain.ChunkingClient && len(execPlan.Chunks) > 0 {
 		_ = s.Events.Emit("stage.started", map[string]any{"stage": domain.StageNormalizing, "message": "creating client chunks"})
@@ -245,6 +255,17 @@ func (s *Services) Transcribe(ctx context.Context, spec domain.JobSpec) (artifac
 				s.Logger.Warn("chunk preparation warning", map[string]any{"code": warning.Code, "message": warning.Message})
 			}
 		}
+		if spec.WriteManifest {
+			resumeStore, err = newChunkResumeStore(spec, execPlan, outputArtifacts, chunkPlan)
+			if err != nil {
+				_ = s.emitFailure(ctx, err)
+				return nil, nil, err
+			}
+			if err := resumeStore.initialize(spec); err != nil {
+				_ = s.emitFailure(ctx, err)
+				return nil, nil, err
+			}
+		}
 		chunkPaths, chunkErr := s.Media.Chunk(ctx, spec, chunkPlan, workdir)
 		timings.Normalize = time.Since(normalizeStarted).Milliseconds()
 		if chunkErr != nil {
@@ -258,15 +279,45 @@ func (s *Services) Transcribe(ctx context.Context, spec domain.JobSpec) (artifac
 		transcripts = make([]domain.Transcript, len(chunkPaths))
 		mergePlans = slices.Clone(chunkPlan)
 		rawJSONs = make([]string, len(chunkPaths))
+		completedChunks := 0
+		if resumeStore != nil {
+			resumedCompleted := 0
+			for i := range chunkPaths {
+				if !resumeStore.hasCompletedChunk(i) {
+					continue
+				}
+				transcripts[i], rawJSONs[i], err = resumeStore.loadChunk(i)
+				if err != nil {
+					_ = s.emitFailure(ctx, err)
+					return nil, nil, err
+				}
+				resumedCompleted++
+				_ = s.Events.Emit("chunk.completed", map[string]any{"chunk_index": i, "reused": true})
+				_ = s.Events.Emit("stage.progress", map[string]any{
+					"stage":         domain.StageTranscribing,
+					"progress":      float64(resumedCompleted) / float64(len(chunkPaths)),
+					"current_chunk": resumedCompleted,
+					"total_chunks":  len(chunkPaths),
+					"message":       fmt.Sprintf("reusing cached chunk %d/%d", resumedCompleted, len(chunkPaths)),
+				})
+				completedChunks++
+			}
+		}
 		if isWhisperParallel(spec) {
 			var (
 				wg        sync.WaitGroup
 				mu        sync.Mutex
 				firstErr  error
-				completed int
+				completed = completedChunks
 				okChunks  = make([]bool, len(chunkPaths))
 			)
+			for i := range chunkPaths {
+				okChunks[i] = resumeStore != nil && resumeStore.hasCompletedChunk(i)
+			}
 			for i, chunkPath := range chunkPaths {
+				if resumeStore != nil && resumeStore.hasCompletedChunk(i) {
+					continue
+				}
 				i, chunkPath := i, chunkPath
 				wg.Add(1)
 				go func() {
@@ -293,6 +344,16 @@ func (s *Services) Transcribe(ctx context.Context, spec domain.JobSpec) (artifac
 						KnownSpeakerNames:          knownSpeakerNames,
 					}, resp.Transcript)
 					rawJSONs[i] = resp.RawJSON
+					if resumeStore != nil {
+						checkpointTimings := timings
+						checkpointTimings.Transcribe = time.Since(transcribeStarted).Milliseconds()
+						if saveErr := resumeStore.saveChunk(i, transcripts[i], rawJSONs[i], checkpointTimings); saveErr != nil {
+							if firstErr == nil {
+								firstErr = saveErr
+							}
+							return
+						}
+					}
 					okChunks[i] = true
 					completed++
 					_ = s.Events.Emit("chunk.completed", map[string]any{"chunk_index": i})
@@ -312,6 +373,9 @@ func (s *Services) Transcribe(ctx context.Context, spec domain.JobSpec) (artifac
 			}
 		} else {
 			for i, chunkPath := range chunkPaths {
+				if resumeStore != nil && resumeStore.hasCompletedChunk(i) {
+					continue
+				}
 				chunkSpec := spec
 				if i > 0 && promptCarryover(chunkPlan, i) {
 					chunkSpec.Prompt = joinPrompt(spec.Prompt, tail(transcripts[i-1].Text, 300))
@@ -334,6 +398,13 @@ func (s *Services) Transcribe(ctx context.Context, spec domain.JobSpec) (artifac
 					KnownSpeakerNames:          knownSpeakerNames,
 				}, resp.Transcript)
 				rawJSONs[i] = resp.RawJSON
+				if resumeStore != nil {
+					checkpointTimings := timings
+					checkpointTimings.Transcribe = time.Since(transcribeStarted).Milliseconds()
+					if saveErr := resumeStore.saveChunk(i, transcripts[i], rawJSONs[i], checkpointTimings); saveErr != nil {
+						return s.handlePartial(ctx, spec, transcripts[:i+1], mergePlans[:i+1], execPlan, timings, saveErr)
+					}
+				}
 				_ = s.Events.Emit("stage.progress", map[string]any{
 					"stage":         domain.StageTranscribing,
 					"progress":      float64(i+1) / float64(len(chunkPaths)),
@@ -450,10 +521,7 @@ func (s *Services) Transcribe(ctx context.Context, spec domain.JobSpec) (artifac
 
 	_ = s.Events.Emit("stage.started", map[string]any{"stage": domain.StageWriting, "message": "writing output"})
 	writeStarted := time.Now()
-	artifacts = execPlan.Artifacts
-	if len(artifacts) == 0 {
-		artifacts = plan.BuildArtifacts(spec)
-	}
+	artifacts = outputArtifacts
 	for i := range artifacts {
 		if writeErr := fs.WriteFile(artifacts[i].Path, rendered, spec.Overwrite); writeErr != nil {
 			err = domain.NewError("write_failed", "failed to write transcript", domain.ExitWrite, writeErr)
@@ -468,23 +536,36 @@ func (s *Services) Transcribe(ctx context.Context, spec domain.JobSpec) (artifac
 	}
 	timings.Write = time.Since(writeStarted).Milliseconds()
 	if spec.WriteManifest && len(artifacts) > 0 {
-		manifest := domain.Manifest{
-			Version:          domain.SchemaVersion,
-			JobID:            spec.JobID,
-			Input:            execPlan.Input,
-			Plan:             domain.PlanSummary{ChunkingMode: execPlan.ChunkingMode, Model: spec.Model, Language: spec.Language},
-			Artifacts:        artifacts,
-			TimingsMS:        timings,
-			Warnings:         transcript.Warnings,
-			MergeDiagnostics: mergeResult.Diagnostics,
-		}
-		manifestData, _ := json.MarshalIndent(manifest, "", "  ")
-		if writeErr := fs.WriteFile(artifacts[0].ManifestPath, manifestData, spec.Overwrite); writeErr != nil {
-			err = domain.NewError("write_failed", "failed to write manifest", domain.ExitWrite, writeErr)
-			_ = s.emitFailure(ctx, err)
-			return nil, nil, err
+		if resumeStore != nil {
+			if writeErr := resumeStore.finalize(spec, execPlan, artifacts, timings, transcript.Warnings, mergeResult.Diagnostics, false); writeErr != nil {
+				err = writeErr
+				_ = s.emitFailure(ctx, err)
+				return nil, nil, err
+			}
+		} else {
+			manifest := domain.Manifest{
+				Version:          domain.SchemaVersion,
+				JobID:            spec.JobID,
+				Input:            execPlan.Input,
+				Plan:             manifestPlanSummary(spec, execPlan),
+				Artifacts:        artifacts,
+				TimingsMS:        timings,
+				Warnings:         transcript.Warnings,
+				MergeDiagnostics: mergeResult.Diagnostics,
+			}
+			manifestData, _ := json.MarshalIndent(manifest, "", "  ")
+			if writeErr := fs.WriteFile(artifacts[0].ManifestPath, manifestData, spec.Overwrite); writeErr != nil {
+				err = domain.NewError("write_failed", "failed to write manifest", domain.ExitWrite, writeErr)
+				_ = s.emitFailure(ctx, err)
+				return nil, nil, err
+			}
 		}
 		_ = s.Events.Emit("artifact.written", map[string]any{"artifact": domain.Artifact{Path: artifacts[0].ManifestPath, Format: domain.FormatJSON, Partial: false}})
+	}
+	if resumeStore != nil {
+		if cleanupErr := resumeStore.cleanupCache(); cleanupErr != nil {
+			s.Logger.Warn("chunk cache cleanup failed", map[string]any{"job_id": spec.JobID, "error": cleanupErr.Error()})
+		}
 	}
 	if spec.RawProviderJSONPath != "" && len(rawJSONs) > 0 {
 		data := marshalRawProviderJSON(rawJSONs)

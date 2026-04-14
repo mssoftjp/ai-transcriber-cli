@@ -87,6 +87,21 @@ func TestBuildSpecCarriesConfiguredAPIKeyEnv(t *testing.T) {
 	}
 }
 
+func TestBuildSpecDefaultsRetriesToOne(t *testing.T) {
+	cfg := config.Default()
+
+	cmd := &cobra.Command{Use: "transcribe"}
+	addCommonTranscribeFlags(cmd)
+
+	spec, err := buildSpec(cfg, cmd, "/tmp/input.mp3")
+	if err != nil {
+		t.Fatalf("buildSpec() error = %v", err)
+	}
+	if spec.Retries != 1 {
+		t.Fatalf("Retries = %d, want 1", spec.Retries)
+	}
+}
+
 func TestBuildSpecNormalizesDiarizeToModel(t *testing.T) {
 	cfg := config.Default()
 
@@ -143,6 +158,46 @@ func TestBuildSpecRejectsMalformedSpeakerRef(t *testing.T) {
 		t.Fatal("expected malformed speaker ref error")
 	}
 	if code := domain.ErrorCode(err); code != "speaker_ref_invalid" {
+		t.Fatalf("unexpected error code: %s", code)
+	}
+}
+
+func TestBuildSpecRejectsResumeWithStdout(t *testing.T) {
+	cfg := config.Default()
+
+	cmd := &cobra.Command{Use: "transcribe"}
+	addCommonTranscribeFlags(cmd)
+	if err := cmd.Flags().Set("resume", "true"); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Flags().Set("stdout", "true"); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := buildSpec(cfg, cmd, "/tmp/input.mp3")
+	if err == nil {
+		t.Fatal("expected error for resume + stdout")
+	}
+	if code := domain.ErrorCode(err); code != "resume_stdout_conflict" {
+		t.Fatalf("unexpected error code: %s", code)
+	}
+}
+
+func TestBuildSpecRejectsResumeWithoutManifest(t *testing.T) {
+	cfg := config.Default()
+	cfg.Output.WriteManifest = false
+
+	cmd := &cobra.Command{Use: "transcribe"}
+	addCommonTranscribeFlags(cmd)
+	if err := cmd.Flags().Set("resume", "true"); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := buildSpec(cfg, cmd, "/tmp/input.mp3")
+	if err == nil {
+		t.Fatal("expected error for resume without manifest")
+	}
+	if code := domain.ErrorCode(err); code != "resume_manifest_required" {
 		t.Fatalf("unexpected error code: %s", code)
 	}
 }

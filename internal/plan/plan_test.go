@@ -58,6 +58,65 @@ func TestPlannerUsesSingleRequestForWhisperAutoWhenInputFits(t *testing.T) {
 	}
 }
 
+func TestPlannerUsesEstimatedIntermediateSizeForLargeVideoAuto(t *testing.T) {
+	planner := NewPlanner()
+	spec := domain.JobSpec{
+		InputPath:    "/tmp/input.mp4",
+		Format:       domain.FormatJSON,
+		Model:        "gpt-4o-transcribe",
+		ChunkingMode: domain.ChunkingAuto,
+	}
+	input := domain.InputInfo{
+		Path:        "/tmp/input.mp4",
+		SizeBytes:   500 * 1024 * 1024,
+		DurationSec: 600,
+		HasAudio:    true,
+		IsVideo:     true,
+	}
+
+	plan, err := planner.Build(spec, input)
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	if !plan.SingleRequestPossible {
+		t.Fatal("expected single-request upload to be possible after video normalization")
+	}
+	if plan.ChunkingMode != domain.ChunkingServerAuto {
+		t.Fatalf("expected server-auto chunking, got %s", plan.ChunkingMode)
+	}
+}
+
+func TestPlannerFallsBackToClientForLongCompressedVideoAuto(t *testing.T) {
+	planner := NewPlanner()
+	spec := domain.JobSpec{
+		InputPath:    "/tmp/input.mp4",
+		Format:       domain.FormatJSON,
+		Model:        "gpt-4o-transcribe",
+		ChunkingMode: domain.ChunkingAuto,
+	}
+	input := domain.InputInfo{
+		Path:        "/tmp/input.mp4",
+		SizeBytes:   10 * 1024 * 1024,
+		DurationSec: 7200,
+		HasAudio:    true,
+		IsVideo:     true,
+	}
+
+	plan, err := planner.Build(spec, input)
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	if plan.SingleRequestPossible {
+		t.Fatal("expected long normalized video audio to require chunking")
+	}
+	if plan.ChunkingMode != domain.ChunkingClient {
+		t.Fatalf("expected client chunking, got %s", plan.ChunkingMode)
+	}
+	if len(plan.Chunks) == 0 {
+		t.Fatal("expected generated chunks for long normalized video audio")
+	}
+}
+
 func TestPlannerEstimatesCompressedIntermediateSize(t *testing.T) {
 	planner := NewPlanner()
 	spec := domain.JobSpec{

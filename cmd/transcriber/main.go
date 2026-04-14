@@ -464,8 +464,9 @@ func addCommonTranscribeFlags(cmd *cobra.Command) {
 	cmd.Flags().String("ffprobe", "", "ffprobe executable path")
 	cmd.Flags().Bool("keep-workdir", false, "keep the temporary workdir and uploaded intermediate .m4a artifacts after completion")
 	cmd.Flags().String("workdir", "", "temporary workdir path for normalized and chunked .m4a artifacts")
+	cmd.Flags().Bool("resume", false, "resume a prior client-chunked transcription using the existing manifest and chunk cache")
 	cmd.Flags().Duration("timeout", 0, "overall job timeout, for example 90s or 10m")
-	cmd.Flags().Int("retries", 0, "retry count for retryable provider failures")
+	cmd.Flags().Int("retries", 1, "retry count for retryable provider failures")
 	cmd.Flags().String("partial-output", "", "partial output policy on failure: write, discard, stdout")
 	cmd.Flags().Bool("dry-run", false, "build the execution plan and exit without calling the provider")
 	cmd.Flags().Bool("include-segments", false, "include segment list in markdown output")
@@ -516,6 +517,7 @@ func buildSpec(cfg config.AppConfig, cmd *cobra.Command, input string) (domain.J
 		FFprobePath:                       valueOr(getString(cmd, "ffprobe"), envOr("TRANSCRIBER_FFPROBE", cfg.Paths.FFprobe)),
 		KeepWorkdir:                       boolValue(cmd, "keep-workdir", cfg.Paths.KeepWorkdir),
 		Workdir:                           valueOr(getString(cmd, "workdir"), cfg.Paths.Workdir),
+		Resume:                            getBool(cmd, "resume"),
 		Timeout:                           getDuration(cmd, "timeout"),
 		Retries:                           getInt(cmd, "retries"),
 		PartialOutput:                     parsePartial(valueOr(getString(cmd, "partial-output"), string(cfg.Output.PartialOutput))),
@@ -566,6 +568,15 @@ func buildSpec(cfg config.AppConfig, cmd *cobra.Command, input string) (domain.J
 	}
 	if spec.Stdout && spec.EventsMode == domain.EventsJSONL {
 		return domain.JobSpec{}, domain.NewError("stdout_events_conflict", "--stdout cannot be used with --events jsonl", domain.ExitArgs, nil)
+	}
+	if spec.Resume && spec.Stdout {
+		return domain.JobSpec{}, domain.NewError("resume_stdout_conflict", "--resume cannot be used with --stdout", domain.ExitArgs, nil)
+	}
+	if spec.Resume && spec.DryRun {
+		return domain.JobSpec{}, domain.NewError("resume_dry_run_conflict", "--resume cannot be used with --dry-run", domain.ExitArgs, nil)
+	}
+	if spec.Resume && !spec.WriteManifest {
+		return domain.JobSpec{}, domain.NewError("resume_manifest_required", "--resume requires --write-manifest", domain.ExitArgs, nil)
 	}
 	if spec.PartialOutput == domain.PartialStdout && !spec.Stdout {
 		return domain.JobSpec{}, domain.NewError("partial_stdout_requires_stdout", "--partial-output stdout requires --stdout", domain.ExitArgs, nil)

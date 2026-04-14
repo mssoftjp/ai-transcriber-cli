@@ -158,6 +158,23 @@ type Artifact struct {
 	ManifestPath string       `json:"manifest_path,omitempty"`
 }
 
+type ChunkStatus string
+
+const (
+	ChunkPending   ChunkStatus = "pending"
+	ChunkCompleted ChunkStatus = "completed"
+)
+
+type ChunkCheckpoint struct {
+	Index          int         `json:"index"`
+	StartSec       float64     `json:"start_sec"`
+	EndSec         float64     `json:"end_sec"`
+	OverlapSec     float64     `json:"overlap_sec"`
+	Status         ChunkStatus `json:"status"`
+	TranscriptPath string      `json:"transcript_path,omitempty"`
+	RawJSONPath    string      `json:"raw_json_path,omitempty"`
+}
+
 type InputInfo struct {
 	Path         string  `json:"path"`
 	SizeBytes    int64   `json:"size_bytes,omitempty"`
@@ -174,6 +191,9 @@ type Manifest struct {
 	JobID            string                    `json:"job_id"`
 	Input            InputInfo                 `json:"input"`
 	Plan             PlanSummary               `json:"plan"`
+	ResumeCapable    bool                      `json:"resume_capable,omitempty"`
+	ChunkCacheDir    string                    `json:"chunk_cache_dir,omitempty"`
+	Chunks           []ChunkCheckpoint         `json:"chunks,omitempty"`
 	Artifacts        []Artifact                `json:"artifacts,omitempty"`
 	TimingsMS        Timings                   `json:"timings_ms"`
 	Warnings         []Warning                 `json:"warnings,omitempty"`
@@ -181,9 +201,11 @@ type Manifest struct {
 }
 
 type PlanSummary struct {
-	ChunkingMode ChunkingMode `json:"chunking_mode"`
-	Model        string       `json:"model"`
-	Language     string       `json:"language"`
+	ChunkingMode                      ChunkingMode `json:"chunking_mode"`
+	Model                             string       `json:"model"`
+	Language                          string       `json:"language"`
+	Format                            OutputFormat `json:"format,omitempty"`
+	AllowExperimentalDiarizeStitching bool         `json:"allow_experimental_diarize_stitching,omitempty"`
 }
 
 type Timings struct {
@@ -259,6 +281,7 @@ type JobSpec struct {
 	FFprobePath                       string
 	KeepWorkdir                       bool
 	Workdir                           string
+	Resume                            bool
 	Timeout                           time.Duration
 	Retries                           int
 	PartialOutput                     PartialOutputMode

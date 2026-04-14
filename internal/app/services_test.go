@@ -83,6 +83,18 @@ func (r *recordingEvents) contains(eventType string) bool {
 	return slices.Contains(r.events, eventType)
 }
 
+func (r *recordingEvents) count(eventType string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	count := 0
+	for _, event := range r.events {
+		if event == eventType {
+			count++
+		}
+	}
+	return count
+}
+
 type parallelWhisperProvider struct {
 	started   chan int
 	release   chan struct{}
@@ -129,6 +141,26 @@ func (p *sequenceProvider) Transcribe(_ context.Context, req domain.ProviderRequ
 }
 
 func (p *sequenceProvider) CheckConnectivity(context.Context) error { return nil }
+
+type scriptedProvider struct {
+	mu        sync.Mutex
+	responses []domain.ProviderResponse
+	errors    []error
+	requests  []domain.ProviderRequest
+}
+
+func (p *scriptedProvider) Transcribe(_ context.Context, req domain.ProviderRequest) (domain.ProviderResponse, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	idx := len(p.requests)
+	p.requests = append(p.requests, req)
+	if idx < len(p.errors) && p.errors[idx] != nil {
+		return domain.ProviderResponse{}, p.errors[idx]
+	}
+	return p.responses[idx], nil
+}
+
+func (p *scriptedProvider) CheckConnectivity(context.Context) error { return nil }
 
 type failIfCalledProvider struct {
 	called bool
@@ -929,6 +961,185 @@ func TestTranscribeRejectsOversizeNormalizedSingleRequest(t *testing.T) {
 	}
 	if provider.called {
 		t.Fatal("provider should not be called for oversize normalized input")
+	}
+}
+
+func TestTranscribeResumeSkipsCompletedClientChunks(t *testing.T) {
+	t.Parallel()
+
+	tempDir := t.TempDir()
+	outputPath := filepath.Join(tempDir, "meeting.transcript.txt")
+	manifestPath := filepath.Join(tempDir, "meeting.transcript.manifest.json")
+	spec := domain.JobSpec{
+		JobID:         "job-resume",
+		InputPath:     filepath.Join(tempDir, "meeting.mp3"),
+		OutputPath:    outputPath,
+		Format:        domain.FormatTXT,
+		Model:         "gpt-4o-transcribe",
+		ChunkingMode:  domain.ChunkingClient,
+		Overwrite:     true,
+		WriteManifest: true,
+	}
+	execPlan := plan.ExecutionPlan{
+		Input:          domain.InputInfo{Path: spec.InputPath, SizeBytes: 30 << 20, DurationSec: 600, HasAudio: true},
+		ChunkingMode:   domain.ChunkingClient,
+		ResponseFormat: "json",
+		Artifacts: []domain.Artifact{{
+			Path:         outputPath,
+			Format:       domain.FormatTXT,
+			ManifestPath: manifestPath,
+		}},
+		Chunks: []domain.ChunkPlan{
+			{Index: 0, StartSec: 0, EndSec: 300, OverlapSec: 30, PromptCarryover: true},
+			{Index: 1, StartSec: 270, EndSec: 600, OverlapSec: 30, PromptCarryover: true},
+		},
+	}
+	firstProvider := &scriptedProvider{
+		responses: []domain.ProviderResponse{{
+			Transcript: domain.Transcript{Version: domain.SchemaVersion, ModelUsed: "gpt-4o-transcribe", Language: "ja", Text: "first chunk"},
+			RawJSON:    `{"chunk":1}`,
+		}},
+		errors: []error{nil, domain.NewError("network_error", "network error", domain.ExitNetwork, nil)},
+	}
+	firstSvc := New(
+		stubMediaService{
+			input:  execPlan.Input,
+			chunks: []string{filepath.Join(tempDir, "chunk-0.m4a"), filepath.Join(tempDir, "chunk-1.m4a")},
+		},
+		stubPlanner{execPlan: execPlan},
+		firstProvider,
+		passthroughOptimizer{},
+		noopPostprocessor{},
+		testLogger(),
+		events.NopWriter{},
+	)
+
+	artifacts, _, err := firstSvc.Transcribe(context.Background(), spec)
+	if err == nil || domain.ExitCode(err) != domain.ExitPartial {
+		t.Fatalf("expected partial error on first run, got %v", err)
+	}
+	if len(artifacts) != 1 || !artifacts[0].Partial {
+		t.Fatalf("expected partial artifact from first run, got %#v", artifacts)
+	}
+
+	resumeSpec := spec
+	resumeSpec.JobID = "job-resume-second"
+	resumeSpec.Resume = true
+	secondProvider := &sequenceProvider{
+		responses: []domain.ProviderResponse{{
+			Transcript: domain.Transcript{Version: domain.SchemaVersion, ModelUsed: "gpt-4o-transcribe", Language: "ja", Text: "second chunk"},
+			RawJSON:    `{"chunk":2}`,
+		}},
+	}
+	secondRecorder := &recordingEvents{}
+	secondSvc := New(
+		stubMediaService{
+			input:  execPlan.Input,
+			chunks: []string{filepath.Join(tempDir, "chunk-0.m4a"), filepath.Join(tempDir, "chunk-1.m4a")},
+		},
+		stubPlanner{execPlan: execPlan},
+		secondProvider,
+		passthroughOptimizer{},
+		noopPostprocessor{},
+		testLogger(),
+		secondRecorder,
+	)
+
+	finalArtifacts, _, err := secondSvc.Transcribe(context.Background(), resumeSpec)
+	if err != nil {
+		t.Fatalf("resume Transcribe() error = %v", err)
+	}
+	if len(secondProvider.requests) != 1 {
+		t.Fatalf("expected one provider request on resume, got %d", len(secondProvider.requests))
+	}
+	if secondRecorder.count("chunk.completed") != 2 {
+		t.Fatalf("expected resume run to report both reused and fresh chunk completions, got %d", secondRecorder.count("chunk.completed"))
+	}
+	if secondRecorder.count("stage.progress") != 2 {
+		t.Fatalf("expected resume run to emit progress for both chunks, got %d", secondRecorder.count("stage.progress"))
+	}
+	if len(finalArtifacts) != 1 || finalArtifacts[0].Path != outputPath {
+		t.Fatalf("unexpected final artifacts: %#v", finalArtifacts)
+	}
+	data, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%s) error = %v", outputPath, err)
+	}
+	if !containsAll(string(data), "first chunk", "second chunk") {
+		t.Fatalf("expected resumed output to include cached and fresh chunks, got %q", string(data))
+	}
+	manifestData, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%s) error = %v", manifestPath, err)
+	}
+	var manifest domain.Manifest
+	if err := json.Unmarshal(manifestData, &manifest); err != nil {
+		t.Fatalf("manifest JSON error = %v", err)
+	}
+	if manifest.ResumeCapable {
+		t.Fatal("expected final manifest to disable resume after successful completion")
+	}
+	if manifest.ChunkCacheDir != "" {
+		t.Fatalf("expected final manifest chunk cache dir to be cleared, got %q", manifest.ChunkCacheDir)
+	}
+	for _, chunk := range manifest.Chunks {
+		if chunk.TranscriptPath != "" || chunk.RawJSONPath != "" {
+			t.Fatalf("expected final manifest chunk cache paths to be cleared, got %#v", chunk)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(tempDir, "meeting.transcript.chunks")); !os.IsNotExist(err) {
+		t.Fatalf("expected chunk cache dir to be removed, stat err = %v", err)
+	}
+}
+
+func TestTranscribeResumeRequiresExistingManifest(t *testing.T) {
+	t.Parallel()
+
+	tempDir := t.TempDir()
+	outputPath := filepath.Join(tempDir, "meeting.transcript.txt")
+	spec := domain.JobSpec{
+		JobID:         "job-resume-missing",
+		InputPath:     filepath.Join(tempDir, "meeting.mp3"),
+		OutputPath:    outputPath,
+		Format:        domain.FormatTXT,
+		Model:         "gpt-4o-transcribe",
+		ChunkingMode:  domain.ChunkingClient,
+		Overwrite:     true,
+		WriteManifest: true,
+		Resume:        true,
+	}
+	execPlan := plan.ExecutionPlan{
+		Input:          domain.InputInfo{Path: spec.InputPath, SizeBytes: 30 << 20, DurationSec: 600, HasAudio: true},
+		ChunkingMode:   domain.ChunkingClient,
+		ResponseFormat: "json",
+		Artifacts: []domain.Artifact{{
+			Path:         outputPath,
+			Format:       domain.FormatTXT,
+			ManifestPath: filepath.Join(tempDir, "meeting.transcript.manifest.json"),
+		}},
+		Chunks: []domain.ChunkPlan{
+			{Index: 0, StartSec: 0, EndSec: 300, OverlapSec: 30, PromptCarryover: true},
+		},
+	}
+	svc := New(
+		stubMediaService{
+			input:  execPlan.Input,
+			chunks: []string{filepath.Join(tempDir, "chunk-0.m4a")},
+		},
+		stubPlanner{execPlan: execPlan},
+		&sequenceProvider{},
+		passthroughOptimizer{},
+		noopPostprocessor{},
+		testLogger(),
+		events.NopWriter{},
+	)
+
+	_, _, err := svc.Transcribe(context.Background(), spec)
+	if err == nil {
+		t.Fatal("expected resume error without manifest")
+	}
+	if domain.ErrorCode(err) != "resume_manifest_missing" {
+		t.Fatalf("unexpected error code: %s", domain.ErrorCode(err))
 	}
 }
 

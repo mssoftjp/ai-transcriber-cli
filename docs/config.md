@@ -275,6 +275,7 @@ Every supported config key is listed below with its default.
   - explicit working directory for normalized audio and chunk artifacts
   - retained artifacts are provider-ready `.m4a` files when ffmpeg preprocessing is used
   - empty means the OS temp directory is used
+  - resume does not depend on reusing this directory; resumable chunk caches live next to the transcript artifacts
 
 ### `keep_workdir`
 
@@ -371,6 +372,7 @@ These controls are not stored in `config.toml`, but they are part of normal oper
 - `--ffprobe`
 - `--workdir`
 - `--keep-workdir`
+- `--resume`
 - `--job-id`
 - `--speaker-ref`
 - `--allow-experimental-diarize-stitching`

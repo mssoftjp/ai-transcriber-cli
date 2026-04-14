@@ -50,14 +50,15 @@ func (p *Planner) Build(spec domain.JobSpec, input domain.InputInfo) (ExecutionP
 		return ExecutionPlan{}, domain.NewError("chunk_overlap_invalid", "--chunk-overlap-sec must be smaller than --chunk-target-sec", domain.ExitArgs, nil)
 	}
 	effectiveInput := applyInputWindow(spec, input)
+	estimatedIntermediateSize := estimateIntermediateSize(effectiveInput)
 	plan := ExecutionPlan{
 		Input:                     effectiveInput,
 		FFmpegRequired:            input.IsVideo || spec.StartSec != nil || spec.EndSec != nil || spec.ChunkingMode == domain.ChunkingClient || spec.VADMode == domain.VADLocal || !domain.ProviderCompatibleAudioExtension(spec.InputPath),
 		NormalizationRequired:     spec.ChunkingMode == domain.ChunkingClient || spec.VADMode == domain.VADLocal,
-		SingleRequestPossible:     input.SizeBytes > 0 && input.SizeBytes <= domain.ProviderUploadLimitBytes,
+		SingleRequestPossible:     singleRequestPossible(spec, input, effectiveInput, estimatedIntermediateSize),
 		TimestampCapable:          domain.SupportsTimestampOutput(spec.Model),
 		DiarizeCapable:            spec.IsDiarize(),
-		EstimatedIntermediateSize: estimateIntermediateSize(effectiveInput),
+		EstimatedIntermediateSize: estimatedIntermediateSize,
 	}
 	plan.ChunkingMode = resolveChunkingMode(spec, plan)
 	if plan.DiarizeCapable && effectiveInput.DurationSec > 30 && plan.ChunkingMode == domain.ChunkingOff {
@@ -75,6 +76,26 @@ func (p *Planner) Build(spec domain.JobSpec, input domain.InputInfo) (ExecutionP
 		plan.Chunks = buildChunks(profile, effectiveInput.DurationSec)
 	}
 	return plan, nil
+}
+
+func singleRequestPossible(spec domain.JobSpec, original, effective domain.InputInfo, estimatedIntermediateSize int64) bool {
+	if originalUploadPossible(spec, original) {
+		return original.SizeBytes > 0 && original.SizeBytes <= domain.ProviderUploadLimitBytes
+	}
+	if effective.DurationSec > 0 {
+		return estimatedIntermediateSize > 0 && estimatedIntermediateSize <= domain.ProviderUploadLimitBytes
+	}
+	return original.SizeBytes > 0 && original.SizeBytes <= domain.ProviderUploadLimitBytes
+}
+
+func originalUploadPossible(spec domain.JobSpec, input domain.InputInfo) bool {
+	if input.IsVideo {
+		return false
+	}
+	if spec.StartSec != nil || spec.EndSec != nil {
+		return false
+	}
+	return domain.ProviderCompatibleAudioExtension(spec.InputPath)
 }
 
 func applyInputWindow(spec domain.JobSpec, input domain.InputInfo) domain.InputInfo {

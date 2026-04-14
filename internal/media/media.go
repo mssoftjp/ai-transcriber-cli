@@ -16,6 +16,8 @@ type Service struct{}
 
 func NewService() *Service { return &Service{} }
 
+var providerReadyAudioArgs = []string{"-ac", "1", "-ar", "16000", "-c:a", "aac", "-b:a", "64k"}
+
 type ffprobeResult struct {
 	Streams []struct {
 		CodecType string `json:"codec_type"`
@@ -86,10 +88,12 @@ func (s *Service) Chunk(ctx context.Context, spec domain.JobSpec, chunks []domai
 		baseOffset = *spec.StartSec
 	}
 	for _, chunk := range chunks {
-		chunkPath := filepath.Join(workdir, fmt.Sprintf("chunk-%03d.wav", chunk.Index))
+		chunkPath := filepath.Join(workdir, fmt.Sprintf("chunk-%03d.m4a", chunk.Index))
 		chunkStart := baseOffset + chunk.StartSec
 		duration := chunk.EndSec - chunk.StartSec
-		args := []string{"-y", "-ss", fmt.Sprintf("%.3f", chunkStart), "-i", spec.InputPath, "-t", fmt.Sprintf("%.3f", duration), "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", chunkPath}
+		args := []string{"-y", "-ss", fmt.Sprintf("%.3f", chunkStart), "-i", spec.InputPath, "-t", fmt.Sprintf("%.3f", duration)}
+		args = append(args, providerReadyAudioArgs...)
+		args = append(args, chunkPath)
 		cmd := exec.CommandContext(ctx, ffmpeg, args...)
 		if output, err := cmd.CombinedOutput(); err != nil {
 			return nil, domain.NewError("ffmpeg_chunk_failed", string(output), domain.ExitDecode, err)
@@ -110,7 +114,7 @@ func (s *Service) Normalize(ctx context.Context, spec domain.JobSpec, workdir st
 	if err := os.MkdirAll(workdir, 0o755); err != nil {
 		return "", err
 	}
-	outPath := filepath.Join(workdir, "normalized.wav")
+	outPath := filepath.Join(workdir, "normalized.m4a")
 	args := []string{"-y"}
 	if spec.StartSec != nil {
 		args = append(args, "-ss", fmt.Sprintf("%.3f", *spec.StartSec))
@@ -121,7 +125,8 @@ func (s *Service) Normalize(ctx context.Context, spec domain.JobSpec, workdir st
 	} else if spec.EndSec != nil {
 		args = append(args, "-t", fmt.Sprintf("%.3f", *spec.EndSec))
 	}
-	args = append(args, "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", outPath)
+	args = append(args, providerReadyAudioArgs...)
+	args = append(args, outPath)
 	cmd := exec.CommandContext(ctx, ffmpeg, args...)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return "", domain.NewError("ffmpeg_normalize_failed", string(output), domain.ExitDecode, err)

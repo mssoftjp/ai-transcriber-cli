@@ -25,6 +25,8 @@ If you prefer a manual install, download the latest archive from [GitHub Release
 
 `ffmpeg` and `ffprobe` are needed for video input, long-file chunking, trimming, and format normalization. Small audio files in a provider-compatible format can be transcribed without them.
 
+When `ffmpeg` is used, the CLI now produces provider-ready intermediate audio as compact `.m4a` files rather than large uncompressed WAV files. If you keep the workdir, the files left behind are the same files that were uploaded.
+
 ```sh
 brew install ffmpeg          # macOS (https://formulae.brew.sh/formula/ffmpeg)
 sudo apt install ffmpeg      # Debian / Ubuntu

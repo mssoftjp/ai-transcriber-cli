@@ -8,8 +8,6 @@ import (
 	"ai-transcriber-cli/internal/domain"
 )
 
-const singleRequestLimitBytes = 25 * 1024 * 1024
-
 type ExecutionPlan struct {
 	Input                     domain.InputInfo    `json:"input"`
 	FFmpegRequired            bool                `json:"ffmpeg_required"`
@@ -56,7 +54,7 @@ func (p *Planner) Build(spec domain.JobSpec, input domain.InputInfo) (ExecutionP
 		Input:                     effectiveInput,
 		FFmpegRequired:            input.IsVideo || spec.StartSec != nil || spec.EndSec != nil || spec.ChunkingMode == domain.ChunkingClient || spec.VADMode == domain.VADLocal || !domain.ProviderCompatibleAudioExtension(spec.InputPath),
 		NormalizationRequired:     spec.ChunkingMode == domain.ChunkingClient || spec.VADMode == domain.VADLocal,
-		SingleRequestPossible:     input.SizeBytes > 0 && input.SizeBytes <= singleRequestLimitBytes,
+		SingleRequestPossible:     input.SizeBytes > 0 && input.SizeBytes <= domain.ProviderUploadLimitBytes,
 		TimestampCapable:          domain.SupportsTimestampOutput(spec.Model),
 		DiarizeCapable:            spec.IsDiarize(),
 		EstimatedIntermediateSize: estimateIntermediateSize(effectiveInput),
@@ -136,7 +134,7 @@ func estimateIntermediateSize(input domain.InputInfo) int64 {
 	if input.DurationSec <= 0 {
 		return input.SizeBytes
 	}
-	return int64(input.DurationSec * 32000)
+	return int64(input.DurationSec * domain.IntermediateAudioBytesPerSec)
 }
 
 func BuildArtifacts(spec domain.JobSpec) []domain.Artifact {

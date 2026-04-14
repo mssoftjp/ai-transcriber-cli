@@ -273,6 +273,7 @@ Every supported config key is listed below with its default.
 - default: `""`
 - meaning:
   - explicit working directory for normalized audio and chunk artifacts
+  - retained artifacts are provider-ready `.m4a` files when ffmpeg preprocessing is used
   - empty means the OS temp directory is used
 
 ### `keep_workdir`
@@ -281,6 +282,7 @@ Every supported config key is listed below with its default.
 - default: `false`
 - meaning:
   - keeps the working directory after the job completes
+  - useful when you want to inspect the exact `.m4a` files that were uploaded
 
 ## `[output]`
 

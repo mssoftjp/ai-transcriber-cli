@@ -355,6 +355,17 @@ func (s *Services) Transcribe(ctx context.Context, spec domain.JobSpec) (artifac
 				_ = s.emitFailure(ctx, err)
 				return nil, nil, err
 			}
+			info, statErr := os.Stat(filePath)
+			if statErr != nil {
+				err = domain.NewError("normalized_input_unreadable", "failed to read normalized audio file", domain.ExitDecode, statErr)
+				_ = s.emitFailure(ctx, err)
+				return nil, nil, err
+			}
+			if info.Size() > domain.ProviderUploadLimitBytes {
+				err = domain.NewError("normalized_input_too_large", "normalized audio exceeds the single-request upload limit", domain.ExitInput, nil)
+				_ = s.emitFailure(ctx, err)
+				return nil, nil, err
+			}
 		}
 		_ = s.Events.Emit("stage.started", map[string]any{"stage": domain.StageTranscribing, "message": "transcribing audio"})
 		transcribeStarted := time.Now()

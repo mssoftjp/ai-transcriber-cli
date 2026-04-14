@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -19,8 +20,9 @@ import (
 )
 
 type stubMediaService struct {
-	input  domain.InputInfo
-	chunks []string
+	input         domain.InputInfo
+	chunks        []string
+	normalizePath string
 }
 
 func (s stubMediaService) Probe(context.Context, string, string) (domain.InputInfo, error) {
@@ -32,7 +34,7 @@ func (s stubMediaService) Chunk(context.Context, domain.JobSpec, []domain.ChunkP
 }
 
 func (s stubMediaService) Normalize(context.Context, domain.JobSpec, string) (string, error) {
-	return "", nil
+	return s.normalizePath, nil
 }
 
 type stubPlanner struct {
@@ -128,6 +130,17 @@ func (p *sequenceProvider) Transcribe(_ context.Context, req domain.ProviderRequ
 
 func (p *sequenceProvider) CheckConnectivity(context.Context) error { return nil }
 
+type failIfCalledProvider struct {
+	called bool
+}
+
+func (p *failIfCalledProvider) Transcribe(_ context.Context, _ domain.ProviderRequest) (domain.ProviderResponse, error) {
+	p.called = true
+	return domain.ProviderResponse{}, errors.New("unexpected transcribe call")
+}
+
+func (p *failIfCalledProvider) CheckConnectivity(context.Context) error { return nil }
+
 type cancelOnSecondProvider struct {
 	mu       sync.Mutex
 	calls    int
@@ -184,7 +197,7 @@ func TestTranscribeWhisperChunksInParallel(t *testing.T) {
 	svc := New(
 		stubMediaService{
 			input:  domain.InputInfo{Path: spec.InputPath, SizeBytes: 30 << 20, DurationSec: 45, HasAudio: true},
-			chunks: []string{"/tmp/chunk-0.wav", "/tmp/chunk-1.wav"},
+			chunks: []string{"/tmp/chunk-0.m4a", "/tmp/chunk-1.m4a"},
 		},
 		stubPlanner{execPlan: execPlan},
 		provider,
@@ -257,7 +270,7 @@ func TestTranscribeFallsBackWhenOptimizerFails(t *testing.T) {
 	svc := New(
 		stubMediaService{
 			input:  domain.InputInfo{Path: spec.InputPath, SizeBytes: 30 << 20, DurationSec: 45, HasAudio: true},
-			chunks: []string{"/tmp/chunk-0.wav", "/tmp/chunk-1.wav"},
+			chunks: []string{"/tmp/chunk-0.m4a", "/tmp/chunk-1.m4a"},
 		},
 		stubPlanner{execPlan: execPlan},
 		&sequenceProvider{responses: []domain.ProviderResponse{
@@ -325,7 +338,7 @@ func TestTranscribeWritesAllRawProviderJSON(t *testing.T) {
 	svc := New(
 		stubMediaService{
 			input:  domain.InputInfo{Path: spec.InputPath, SizeBytes: 30 << 20, DurationSec: 600, HasAudio: true},
-			chunks: []string{filepath.Join(tempDir, "chunk-0.wav"), filepath.Join(tempDir, "chunk-1.wav")},
+			chunks: []string{filepath.Join(tempDir, "chunk-0.m4a"), filepath.Join(tempDir, "chunk-1.m4a")},
 		},
 		stubPlanner{execPlan: execPlan},
 		provider,
@@ -392,7 +405,7 @@ func TestTranscribeGpt4oCarriesPromptSequentially(t *testing.T) {
 	svc := New(
 		stubMediaService{
 			input:  domain.InputInfo{Path: spec.InputPath, SizeBytes: 30 << 20, DurationSec: 600, HasAudio: true},
-			chunks: []string{"/tmp/chunk-0.wav", "/tmp/chunk-1.wav"},
+			chunks: []string{"/tmp/chunk-0.m4a", "/tmp/chunk-1.m4a"},
 		},
 		stubPlanner{execPlan: execPlan},
 		provider,
@@ -455,7 +468,7 @@ func TestTranscribeCancellationWritesPartialAndCancelledEvent(t *testing.T) {
 	svc := New(
 		stubMediaService{
 			input:  domain.InputInfo{Path: spec.InputPath, SizeBytes: 30 << 20, DurationSec: 600, HasAudio: true},
-			chunks: []string{filepath.Join(tempDir, "chunk-0.wav"), filepath.Join(tempDir, "chunk-1.wav")},
+			chunks: []string{filepath.Join(tempDir, "chunk-0.m4a"), filepath.Join(tempDir, "chunk-1.m4a")},
 		},
 		stubPlanner{execPlan: execPlan},
 		&cancelOnSecondProvider{
@@ -530,7 +543,7 @@ func TestTranscribeCancellationOverwritesExistingPartialArtifact(t *testing.T) {
 	svc := New(
 		stubMediaService{
 			input:  domain.InputInfo{Path: spec.InputPath, SizeBytes: 30 << 20, DurationSec: 600, HasAudio: true},
-			chunks: []string{filepath.Join(tempDir, "chunk-0.wav"), filepath.Join(tempDir, "chunk-1.wav")},
+			chunks: []string{filepath.Join(tempDir, "chunk-0.m4a"), filepath.Join(tempDir, "chunk-1.m4a")},
 		},
 		stubPlanner{execPlan: execPlan},
 		&cancelOnSecondProvider{
@@ -669,7 +682,7 @@ func TestTranscribeWritesMergeDiagnosticsToManifest(t *testing.T) {
 	svc := New(
 		stubMediaService{
 			input:  domain.InputInfo{Path: spec.InputPath, SizeBytes: 30 << 20, DurationSec: 570, HasAudio: true},
-			chunks: []string{filepath.Join(tempDir, "chunk-0.wav"), filepath.Join(tempDir, "chunk-1.wav")},
+			chunks: []string{filepath.Join(tempDir, "chunk-0.m4a"), filepath.Join(tempDir, "chunk-1.m4a")},
 		},
 		stubPlanner{execPlan: execPlan},
 		&sequenceProvider{
@@ -730,7 +743,7 @@ func TestTranscribeEmitsChunkPreparationWarnings(t *testing.T) {
 	svc := New(
 		stubMediaService{
 			input:  domain.InputInfo{Path: spec.InputPath, SizeBytes: 30 << 20, DurationSec: 300, HasAudio: true},
-			chunks: []string{filepath.Join(tempDir, "chunk-0.wav")},
+			chunks: []string{filepath.Join(tempDir, "chunk-0.m4a")},
 		},
 		stubPlanner{execPlan: execPlan},
 		&sequenceProvider{
@@ -803,6 +816,119 @@ func TestDryRunReturnsProbeAndPlan(t *testing.T) {
 	}
 	if _, ok := data["plan"].(plan.ExecutionPlan); !ok {
 		t.Fatalf("plan payload has unexpected type: %T", data["plan"])
+	}
+}
+
+func TestTranscribeUsesNormalizedM4AForSingleRequest(t *testing.T) {
+	t.Parallel()
+
+	tempDir := t.TempDir()
+	normalizedPath := filepath.Join(tempDir, "normalized.m4a")
+	if err := os.WriteFile(normalizedPath, []byte("normalized audio"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	spec := domain.JobSpec{
+		JobID:         "job-normalize-single",
+		InputPath:     filepath.Join(tempDir, "input.mov"),
+		Format:        domain.FormatTXT,
+		Model:         "gpt-4o-transcribe",
+		Stdout:        true,
+		WriteManifest: false,
+	}
+	execPlan := plan.ExecutionPlan{
+		Input:                 domain.InputInfo{Path: spec.InputPath, SizeBytes: 1024, DurationSec: 30, HasAudio: true, IsVideo: true},
+		FFmpegRequired:        true,
+		ChunkingMode:          domain.ChunkingOff,
+		ResponseFormat:        "json",
+		SingleRequestPossible: true,
+	}
+	provider := &sequenceProvider{
+		responses: []domain.ProviderResponse{{
+			Transcript: domain.Transcript{Version: domain.SchemaVersion, ModelUsed: "gpt-4o-transcribe", Language: "ja", Text: "done"},
+		}},
+	}
+	svc := New(
+		stubMediaService{
+			input:         execPlan.Input,
+			normalizePath: normalizedPath,
+		},
+		stubPlanner{execPlan: execPlan},
+		provider,
+		passthroughOptimizer{},
+		noopPostprocessor{},
+		testLogger(),
+		events.NopWriter{},
+	)
+
+	_, out, err := svc.Transcribe(context.Background(), spec)
+	if err != nil {
+		t.Fatalf("Transcribe() error = %v", err)
+	}
+	if len(out) == 0 {
+		t.Fatal("expected stdout output")
+	}
+	if len(provider.requests) != 1 {
+		t.Fatalf("expected one provider request, got %d", len(provider.requests))
+	}
+	if provider.requests[0].FilePath != normalizedPath {
+		t.Fatalf("expected normalized file path %q, got %q", normalizedPath, provider.requests[0].FilePath)
+	}
+}
+
+func TestTranscribeRejectsOversizeNormalizedSingleRequest(t *testing.T) {
+	t.Parallel()
+
+	tempDir := t.TempDir()
+	normalizedPath := filepath.Join(tempDir, "normalized.m4a")
+	file, err := os.Create(normalizedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Truncate(domain.ProviderUploadLimitBytes + 1); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	provider := &failIfCalledProvider{}
+	spec := domain.JobSpec{
+		JobID:         "job-normalize-too-large",
+		InputPath:     filepath.Join(tempDir, "input.mov"),
+		Format:        domain.FormatTXT,
+		Model:         "gpt-4o-transcribe",
+		Stdout:        true,
+		WriteManifest: false,
+	}
+	execPlan := plan.ExecutionPlan{
+		Input:                 domain.InputInfo{Path: spec.InputPath, SizeBytes: 1024, DurationSec: 30, HasAudio: true, IsVideo: true},
+		FFmpegRequired:        true,
+		ChunkingMode:          domain.ChunkingOff,
+		ResponseFormat:        "json",
+		SingleRequestPossible: true,
+	}
+	svc := New(
+		stubMediaService{
+			input:         execPlan.Input,
+			normalizePath: normalizedPath,
+		},
+		stubPlanner{execPlan: execPlan},
+		provider,
+		passthroughOptimizer{},
+		noopPostprocessor{},
+		testLogger(),
+		events.NopWriter{},
+	)
+
+	_, _, err = svc.Transcribe(context.Background(), spec)
+	if err == nil {
+		t.Fatal("expected oversize normalized input error")
+	}
+	if domain.ErrorCode(err) != "normalized_input_too_large" {
+		t.Fatalf("unexpected error code: %s", domain.ErrorCode(err))
+	}
+	if provider.called {
+		t.Fatal("provider should not be called for oversize normalized input")
 	}
 }
 

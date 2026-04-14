@@ -58,6 +58,31 @@ func TestPlannerUsesSingleRequestForWhisperAutoWhenInputFits(t *testing.T) {
 	}
 }
 
+func TestPlannerEstimatesCompressedIntermediateSize(t *testing.T) {
+	planner := NewPlanner()
+	spec := domain.JobSpec{
+		InputPath:    "/tmp/input.mp3",
+		Format:       domain.FormatJSON,
+		Model:        "gpt-4o-transcribe",
+		ChunkingMode: domain.ChunkingAuto,
+	}
+	input := domain.InputInfo{
+		Path:        "/tmp/input.mp3",
+		SizeBytes:   2 * 1024 * 1024,
+		DurationSec: 120,
+		HasAudio:    true,
+	}
+
+	execPlan, err := planner.Build(spec, input)
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	expected := int64(120 * domain.IntermediateAudioBytesPerSec)
+	if execPlan.EstimatedIntermediateSize != expected {
+		t.Fatalf("estimated size = %d, want %d", execPlan.EstimatedIntermediateSize, expected)
+	}
+}
+
 func TestPlannerRejectsUnsupportedExtensionAsInputError(t *testing.T) {
 	planner := NewPlanner()
 	_, err := planner.Build(domain.JobSpec{

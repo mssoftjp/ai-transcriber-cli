@@ -57,7 +57,7 @@ These examples are intentionally small. They show the payload shape that automat
     ],
     "diarize_capable": false,
     "timestamp_capable": false,
-    "estimated_intermediate_size": 833600
+    "estimated_intermediate_size": 208400
   },
   "plan": {
     "input": {
@@ -75,7 +75,7 @@ These examples are intentionally small. They show the payload shape that automat
     "response_format": "json",
     "timestamp_capable": false,
     "diarize_capable": false,
-    "estimated_intermediate_size": 833600,
+    "estimated_intermediate_size": 208400,
     "artifacts": [
       {
         "path": "/abs/path/input.transcript.md",

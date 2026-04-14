@@ -51,7 +51,7 @@ hooks:
 	git config core.hooksPath .githooks
 
 release-archive:
-	@[ -n "$(VERSION)" ] || (echo "VERSION is required, e.g. make release-archive VERSION=v0.1.0 GOOS=darwin GOARCH=arm64" >&2; exit 1)
+	@[ -n "$(VERSION)" ] || (echo "VERSION is required, e.g. make release-archive VERSION=v0.2.0 GOOS=darwin GOARCH=arm64" >&2; exit 1)
 	@[ -n "$(GOOS)" ] || (echo "GOOS is required" >&2; exit 1)
 	@[ -n "$(GOARCH)" ] || (echo "GOARCH is required" >&2; exit 1)
 	mkdir -p "$(DIST_DIR)"
@@ -59,7 +59,7 @@ release-archive:
 		./scripts/package.sh --version "$(VERSION)" --output-dir "$(DIST_DIR)"
 
 package:
-	@[ -n "$(VERSION)" ] || (echo "VERSION is required, e.g. make package VERSION=v0.1.0" >&2; exit 1)
+	@[ -n "$(VERSION)" ] || (echo "VERSION is required, e.g. make package VERSION=v0.2.0" >&2; exit 1)
 	mkdir -p "$(DIST_DIR)"
 	GO="$(GO)" GOOS="$(GOOS)" GOARCH="$(GOARCH)" VERSION="$(VERSION)" COMMIT="$(COMMIT)" DATE="$(DATE)" \
 		./scripts/package.sh --version "$(VERSION)" --output-dir "$(DIST_DIR)"

@@ -220,13 +220,13 @@ make build
 Build a versioned release archive plus `checksums.txt`:
 
 ```sh
-make package VERSION=v0.1.0
+make package VERSION=v0.2.0
 ```
 
 Build a cross-target release archive:
 
 ```sh
-make release-archive VERSION=v0.1.0 GOOS=darwin GOARCH=arm64
+make release-archive VERSION=v0.2.0 GOOS=darwin GOARCH=arm64
 ```
 
 Packaging notes:

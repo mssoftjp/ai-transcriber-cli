@@ -4,6 +4,13 @@
 
 - No unreleased changes yet.
 
+## v0.2.0
+
+- Switch ffmpeg-generated intermediate audio from large WAV files to compact provider-ready `.m4a` artifacts.
+- Keep workdir artifacts aligned with what was actually uploaded to the provider.
+- Add a single-request runtime guard that rejects normalized audio exceeding the provider upload size limit.
+- Update intermediate-size estimation to match compressed AAC/M4A output more closely.
+
 ## v0.1.1
 
 - Fix GitHub Actions lint execution so CI works correctly with the repository Go version.

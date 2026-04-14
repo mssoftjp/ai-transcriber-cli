@@ -78,6 +78,8 @@ Supported input formats include `.mp3`, `.m4a`, `.wav`, `.flac`, `.ogg`, `.mp4`,
 
 If a long client-chunked job fails partway through, re-run the same command with `--resume` to reuse completed chunks from the manifest sidecar and chunk cache next to the output artifacts.
 
+For long client-chunked jobs with `gpt-4o-transcribe` or `gpt-4o-mini-transcribe`, you can add `--parallel` to send chunks concurrently. This speeds up long runs, but it disables prompt carryover for those chunks.
+
 ## Choosing a Model
 
 | Model | Strengths | Good for |
@@ -133,6 +135,21 @@ Runs a transcript-level correction pass after transcription. It does not summari
 ```sh
 transcriber transcribe input.m4a --postprocess
 ```
+
+### Faster Long-Form Runs
+
+For `gpt-4o-transcribe` and `gpt-4o-mini-transcribe`, `--parallel` sends client chunks concurrently.
+
+```sh
+transcriber transcribe meeting.m4a --model gpt-4o-mini-transcribe --chunking-mode client --parallel
+```
+
+Notes:
+
+- `--parallel` is useful only when the execution plan uses client-side chunking
+- when the input fits in a single request or uses server-side chunking, `--parallel` has no effect
+- parallel chunk sending disables prompt carryover, so the default sequential mode remains the safer quality-first option
+- if you resume a partial client-chunked run, use the same `--parallel` setting as the original run
 
 ### Pre-Flight Checks (dry-run / probe)
 
@@ -222,13 +239,13 @@ make build
 Build a versioned release archive plus `checksums.txt`:
 
 ```sh
-make package VERSION=v0.2.0
+make package VERSION=v0.3.0
 ```
 
 Build a cross-target release archive:
 
 ```sh
-make release-archive VERSION=v0.2.0 GOOS=darwin GOARCH=arm64
+make release-archive VERSION=v0.3.0 GOOS=darwin GOARCH=arm64
 ```
 
 Packaging notes:

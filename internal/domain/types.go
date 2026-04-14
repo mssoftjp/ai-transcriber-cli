@@ -202,6 +202,7 @@ type Manifest struct {
 
 type PlanSummary struct {
 	ChunkingMode                      ChunkingMode `json:"chunking_mode"`
+	ChunkExecutionMode                string       `json:"chunk_execution_mode,omitempty"`
 	Model                             string       `json:"model"`
 	Language                          string       `json:"language"`
 	Format                            OutputFormat `json:"format,omitempty"`
@@ -284,6 +285,7 @@ type JobSpec struct {
 	Resume                            bool
 	Timeout                           time.Duration
 	Retries                           int
+	Parallel                          bool
 	PartialOutput                     PartialOutputMode
 	Overwrite                         bool
 	WriteManifest                     bool

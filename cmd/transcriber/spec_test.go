@@ -102,6 +102,43 @@ func TestBuildSpecDefaultsRetriesToOne(t *testing.T) {
 	}
 }
 
+func TestBuildSpecCarriesParallelFlag(t *testing.T) {
+	cfg := config.Default()
+
+	cmd := &cobra.Command{Use: "transcribe"}
+	addCommonTranscribeFlags(cmd)
+	if err := cmd.Flags().Set("parallel", "true"); err != nil {
+		t.Fatal(err)
+	}
+
+	spec, err := buildSpec(cfg, cmd, "/tmp/input.mp3")
+	if err != nil {
+		t.Fatalf("buildSpec() error = %v", err)
+	}
+	if !spec.Parallel {
+		t.Fatal("expected --parallel to set JobSpec.Parallel")
+	}
+}
+
+func TestBuildSpecRejectsParallelForUnsupportedModel(t *testing.T) {
+	cfg := config.Default()
+	cfg.Transcription.Model = "whisper-1"
+
+	cmd := &cobra.Command{Use: "transcribe"}
+	addCommonTranscribeFlags(cmd)
+	if err := cmd.Flags().Set("parallel", "true"); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := buildSpec(cfg, cmd, "/tmp/input.mp3")
+	if err == nil {
+		t.Fatal("expected unsupported parallel model error")
+	}
+	if code := domain.ErrorCode(err); code != "parallel_model_not_supported" {
+		t.Fatalf("unexpected error code: %s", code)
+	}
+}
+
 func TestBuildSpecNormalizesDiarizeToModel(t *testing.T) {
 	cfg := config.Default()
 

@@ -465,6 +465,7 @@ func addCommonTranscribeFlags(cmd *cobra.Command) {
 	cmd.Flags().Bool("keep-workdir", false, "keep the temporary workdir and uploaded intermediate .m4a artifacts after completion")
 	cmd.Flags().String("workdir", "", "temporary workdir path for normalized and chunked .m4a artifacts")
 	cmd.Flags().Bool("resume", false, "resume a prior client-chunked transcription using the existing manifest and chunk cache")
+	cmd.Flags().Bool("parallel", false, "send client chunks in parallel for gpt-4o-transcribe and gpt-4o-mini-transcribe")
 	cmd.Flags().Duration("timeout", 0, "overall job timeout, for example 90s or 10m")
 	cmd.Flags().Int("retries", 1, "retry count for retryable provider failures")
 	cmd.Flags().String("partial-output", "", "partial output policy on failure: write, discard, stdout")
@@ -520,6 +521,7 @@ func buildSpec(cfg config.AppConfig, cmd *cobra.Command, input string) (domain.J
 		Resume:                            getBool(cmd, "resume"),
 		Timeout:                           getDuration(cmd, "timeout"),
 		Retries:                           getInt(cmd, "retries"),
+		Parallel:                          getBool(cmd, "parallel"),
 		PartialOutput:                     parsePartial(valueOr(getString(cmd, "partial-output"), string(cfg.Output.PartialOutput))),
 		Overwrite:                         boolValue(cmd, "overwrite", cfg.Output.Overwrite),
 		WriteManifest:                     boolValue(cmd, "write-manifest", cfg.Output.WriteManifest),
@@ -581,6 +583,9 @@ func buildSpec(cfg config.AppConfig, cmd *cobra.Command, input string) (domain.J
 	if spec.PartialOutput == domain.PartialStdout && !spec.Stdout {
 		return domain.JobSpec{}, domain.NewError("partial_stdout_requires_stdout", "--partial-output stdout requires --stdout", domain.ExitArgs, nil)
 	}
+	if spec.Parallel && !supportsManualParallel(spec.Model) {
+		return domain.JobSpec{}, domain.NewError("parallel_model_not_supported", "--parallel is supported only with gpt-4o-transcribe and gpt-4o-mini-transcribe", domain.ExitArgs, nil)
+	}
 	if err := domain.ValidatePrompt(spec.Model, spec.Prompt); err != nil {
 		return domain.JobSpec{}, err
 	}
@@ -595,6 +600,15 @@ func buildSpec(cfg config.AppConfig, cmd *cobra.Command, input string) (domain.J
 		return domain.JobSpec{}, domain.NewError("time_range_invalid", "--end must be greater than --start", domain.ExitArgs, nil)
 	}
 	return spec, nil
+}
+
+func supportsManualParallel(model string) bool {
+	switch model {
+	case "gpt-4o-transcribe", "gpt-4o-mini-transcribe":
+		return true
+	default:
+		return false
+	}
 }
 
 func buildServices(spec domain.JobSpec) (*app.Services, context.Context, context.CancelFunc, error) {

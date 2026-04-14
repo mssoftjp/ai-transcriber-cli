@@ -373,9 +373,19 @@ These controls are not stored in `config.toml`, but they are part of normal oper
 - `--workdir`
 - `--keep-workdir`
 - `--resume`
+- `--parallel`
 - `--job-id`
 - `--speaker-ref`
 - `--allow-experimental-diarize-stitching`
+
+### `--parallel`
+
+- CLI-only; not stored in `config.toml`
+- supported only by `gpt-4o-transcribe` and `gpt-4o-mini-transcribe`
+- only affects runs that actually use `client` chunking
+- when effective, chunk requests are sent concurrently and prompt carryover is disabled
+- if the planner chooses single-request or server-side chunking, the flag has no effect and the job proceeds normally
+- if you later run `--resume`, the resumable manifest must match the original chunk execution mode
 
 ## Time Range Selection
 

@@ -123,6 +123,7 @@ These examples are intentionally small. They show the payload shape that automat
   },
   "plan": {
     "chunking_mode": "off",
+    "chunk_execution_mode": "serial",
     "model": "gpt-4o-mini-transcribe",
     "language": "auto"
   },
@@ -153,6 +154,8 @@ These examples are intentionally small. They show the payload shape that automat
 - `--stdout` and `--events jsonl` are mutually exclusive
 - `--partial-output` controls failure behavior: `write`, `discard`, or `stdout`
 - `--resume` reuses completed client-side chunks from the existing manifest sidecar and chunk cache
+- `--parallel` is supported for `gpt-4o-transcribe` and `gpt-4o-mini-transcribe`
+- when effective, `--parallel` applies only to client-side chunking and disables prompt carryover for chunk requests
 
 ## Event Contract
 
@@ -196,6 +199,7 @@ Failure-oriented automation should also expect:
 - `job.partial` when partial output is produced
 - `job.cancelled` on cancellation
 - resumable manifests for client-chunked jobs may include `resume_capable`, `chunk_cache_dir`, and `chunks`
+- manifest `plan.chunk_execution_mode` records whether client chunks ran as `serial` or `parallel`
 
 ## Exit Codes
 
@@ -223,3 +227,4 @@ Failure-oriented automation should also expect:
 - `probe` does not upload audio and is intended as the safe planning step for automation
 - `transcribe --dry-run` returns planning data without calling the provider
 - `--resume` is supported only for client-chunked transcription jobs that wrote a manifest in an earlier partial run
+- resumable client-chunked runs must match the original `chunk_execution_mode`

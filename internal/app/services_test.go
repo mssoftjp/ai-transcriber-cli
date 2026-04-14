@@ -67,20 +67,30 @@ func (failingOptimizer) Optimize(_ context.Context, _ domain.JobSpec, chunks []d
 
 type recordingEvents struct {
 	mu     sync.Mutex
-	events []string
+	events []recordedEvent
 }
 
-func (r *recordingEvents) Emit(eventType string, _ map[string]any) error {
+type recordedEvent struct {
+	eventType string
+	payload   map[string]any
+}
+
+func (r *recordingEvents) Emit(eventType string, payload map[string]any) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.events = append(r.events, eventType)
+	r.events = append(r.events, recordedEvent{eventType: eventType, payload: payload})
 	return nil
 }
 
 func (r *recordingEvents) contains(eventType string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return slices.Contains(r.events, eventType)
+	for _, event := range r.events {
+		if event.eventType == eventType {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *recordingEvents) count(eventType string) int {
@@ -88,11 +98,26 @@ func (r *recordingEvents) count(eventType string) int {
 	defer r.mu.Unlock()
 	count := 0
 	for _, event := range r.events {
-		if event == eventType {
+		if event.eventType == eventType {
 			count++
 		}
 	}
 	return count
+}
+
+func (r *recordingEvents) warningCodes() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var codes []string
+	for _, event := range r.events {
+		if event.eventType != "warning" {
+			continue
+		}
+		if code, ok := event.payload["code"].(string); ok {
+			codes = append(codes, code)
+		}
+	}
+	return codes
 }
 
 type parallelWhisperProvider struct {
@@ -125,6 +150,99 @@ func (p *parallelWhisperProvider) prompts() []string {
 		out = append(out, req.Spec.Prompt)
 	}
 	return out
+}
+
+type boundedParallelProvider struct {
+	started     chan int
+	release     chan struct{}
+	mu          sync.Mutex
+	requests    []domain.ProviderRequest
+	responses   []domain.ProviderResponse
+	inFlight    int
+	maxInFlight int
+}
+
+func (p *boundedParallelProvider) Transcribe(_ context.Context, req domain.ProviderRequest) (domain.ProviderResponse, error) {
+	p.mu.Lock()
+	idx := len(p.requests)
+	p.requests = append(p.requests, req)
+	p.inFlight++
+	if p.inFlight > p.maxInFlight {
+		p.maxInFlight = p.inFlight
+	}
+	resp := p.responses[idx]
+	p.mu.Unlock()
+
+	p.started <- idx
+	<-p.release
+
+	p.mu.Lock()
+	p.inFlight--
+	p.mu.Unlock()
+	return resp, nil
+}
+
+func (p *boundedParallelProvider) CheckConnectivity(context.Context) error { return nil }
+
+func (p *boundedParallelProvider) prompts() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]string, 0, len(p.requests))
+	for _, req := range p.requests {
+		out = append(out, req.Spec.Prompt)
+	}
+	return out
+}
+
+func (p *boundedParallelProvider) maxParallelism() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.maxInFlight
+}
+
+type cancelAwareParallelProvider struct {
+	started  chan int
+	success  domain.ProviderResponse
+	release  chan struct{}
+	mu       sync.Mutex
+	requests []domain.ProviderRequest
+	cancels  int
+}
+
+func (p *cancelAwareParallelProvider) Transcribe(ctx context.Context, req domain.ProviderRequest) (domain.ProviderResponse, error) {
+	p.mu.Lock()
+	idx := len(p.requests)
+	p.requests = append(p.requests, req)
+	p.mu.Unlock()
+
+	p.started <- idx
+	if idx == 0 {
+		<-p.release
+		return p.success, nil
+	}
+	if idx == 1 {
+		return domain.ProviderResponse{}, domain.NewError("network_error", "network error", domain.ExitNetwork, nil)
+	}
+
+	<-ctx.Done()
+	p.mu.Lock()
+	p.cancels++
+	p.mu.Unlock()
+	return domain.ProviderResponse{}, ctx.Err()
+}
+
+func (p *cancelAwareParallelProvider) CheckConnectivity(context.Context) error { return nil }
+
+func (p *cancelAwareParallelProvider) cancelCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.cancels
+}
+
+func (p *cancelAwareParallelProvider) requestCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.requests)
 }
 
 type sequenceProvider struct {
@@ -275,6 +393,361 @@ func TestTranscribeWhisperChunksInParallel(t *testing.T) {
 		if prompt != "" {
 			t.Fatalf("expected whisper chunk requests to avoid prompt carryover, got %q", prompt)
 		}
+	}
+}
+
+func TestTranscribeGpt4oParallelDisablesCarryoverAndBoundsConcurrency(t *testing.T) {
+	t.Parallel()
+
+	tempDir := t.TempDir()
+	spec := domain.JobSpec{
+		JobID:         "job-gpt4o-parallel",
+		InputPath:     filepath.Join(tempDir, "input.mp3"),
+		Format:        domain.FormatTXT,
+		Model:         "gpt-4o-transcribe",
+		Prompt:        "domain terms",
+		ChunkingMode:  domain.ChunkingClient,
+		Parallel:      true,
+		Stdout:        true,
+		WriteManifest: false,
+	}
+	execPlan := plan.ExecutionPlan{
+		ChunkingMode:   domain.ChunkingClient,
+		ResponseFormat: "json",
+		Chunks: []domain.ChunkPlan{
+			{Index: 0, StartSec: 0, EndSec: 300, OverlapSec: 30, PromptCarryover: true},
+			{Index: 1, StartSec: 270, EndSec: 600, OverlapSec: 30, PromptCarryover: true},
+			{Index: 2, StartSec: 570, EndSec: 900, OverlapSec: 30, PromptCarryover: true},
+			{Index: 3, StartSec: 870, EndSec: 1200, OverlapSec: 30, PromptCarryover: true},
+		},
+	}
+	provider := &boundedParallelProvider{
+		started: make(chan int, 4),
+		release: make(chan struct{}),
+		responses: []domain.ProviderResponse{
+			{Transcript: domain.Transcript{Version: domain.SchemaVersion, ModelUsed: "gpt-4o-transcribe", Language: "ja", Text: "one"}},
+			{Transcript: domain.Transcript{Version: domain.SchemaVersion, ModelUsed: "gpt-4o-transcribe", Language: "ja", Text: "two"}},
+			{Transcript: domain.Transcript{Version: domain.SchemaVersion, ModelUsed: "gpt-4o-transcribe", Language: "ja", Text: "three"}},
+			{Transcript: domain.Transcript{Version: domain.SchemaVersion, ModelUsed: "gpt-4o-transcribe", Language: "ja", Text: "four"}},
+		},
+	}
+	recorder := &recordingEvents{}
+	svc := New(
+		stubMediaService{
+			input: domain.InputInfo{Path: spec.InputPath, SizeBytes: 60 << 20, DurationSec: 1200, HasAudio: true},
+			chunks: []string{
+				filepath.Join(tempDir, "chunk-0.m4a"),
+				filepath.Join(tempDir, "chunk-1.m4a"),
+				filepath.Join(tempDir, "chunk-2.m4a"),
+				filepath.Join(tempDir, "chunk-3.m4a"),
+			},
+		},
+		stubPlanner{execPlan: execPlan},
+		provider,
+		passthroughOptimizer{},
+		noopPostprocessor{},
+		testLogger(),
+		recorder,
+	)
+
+	resultCh := make(chan error, 1)
+	go func() {
+		_, _, err := svc.Transcribe(context.Background(), spec)
+		resultCh <- err
+	}()
+
+	for i := 0; i < defaultParallelWorkers; i++ {
+		select {
+		case <-provider.started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("expected bounded parallel requests to start")
+		}
+	}
+	select {
+	case <-provider.started:
+		t.Fatal("expected the fourth request to wait for the worker pool")
+	case <-time.After(150 * time.Millisecond):
+	}
+	close(provider.release)
+
+	select {
+	case err := <-resultCh:
+		if err != nil {
+			t.Fatalf("Transcribe() error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Transcribe() did not finish")
+	}
+
+	if provider.maxParallelism() != defaultParallelWorkers {
+		t.Fatalf("max parallelism = %d, want %d", provider.maxParallelism(), defaultParallelWorkers)
+	}
+	for _, prompt := range provider.prompts() {
+		if prompt != spec.Prompt {
+			t.Fatalf("expected prompt carryover to stay disabled, got %q", prompt)
+		}
+	}
+	if !slices.Contains(recorder.warningCodes(), "parallel_prompt_carryover_disabled") {
+		t.Fatalf("expected carryover warning, got %#v", recorder.warningCodes())
+	}
+}
+
+func TestTranscribeGpt4oMiniParallelWritesManifestExecutionMode(t *testing.T) {
+	t.Parallel()
+
+	tempDir := t.TempDir()
+	outputPath := filepath.Join(tempDir, "out.json")
+	manifestPath := filepath.Join(tempDir, "out.manifest.json")
+	spec := domain.JobSpec{
+		JobID:         "job-gpt4omini-parallel",
+		InputPath:     filepath.Join(tempDir, "input.mp3"),
+		OutputPath:    outputPath,
+		Format:        domain.FormatJSON,
+		Model:         "gpt-4o-mini-transcribe",
+		Prompt:        "mini prompt",
+		ChunkingMode:  domain.ChunkingClient,
+		Parallel:      true,
+		Overwrite:     true,
+		WriteManifest: true,
+	}
+	execPlan := plan.ExecutionPlan{
+		Input:          domain.InputInfo{Path: spec.InputPath, SizeBytes: 40 << 20, DurationSec: 600, HasAudio: true},
+		ChunkingMode:   domain.ChunkingClient,
+		ResponseFormat: "json",
+		Artifacts: []domain.Artifact{{
+			Path:         outputPath,
+			Format:       domain.FormatJSON,
+			ManifestPath: manifestPath,
+		}},
+		Chunks: []domain.ChunkPlan{
+			{Index: 0, StartSec: 0, EndSec: 240, OverlapSec: 30, PromptCarryover: true},
+			{Index: 1, StartSec: 210, EndSec: 450, OverlapSec: 30, PromptCarryover: true},
+		},
+	}
+	provider := &boundedParallelProvider{
+		started: make(chan int, 2),
+		release: make(chan struct{}),
+		responses: []domain.ProviderResponse{
+			{Transcript: domain.Transcript{Version: domain.SchemaVersion, ModelUsed: "gpt-4o-mini-transcribe", Language: "ja", Text: "alpha"}},
+			{Transcript: domain.Transcript{Version: domain.SchemaVersion, ModelUsed: "gpt-4o-mini-transcribe", Language: "ja", Text: "beta"}},
+		},
+	}
+	recorder := &recordingEvents{}
+	svc := New(
+		stubMediaService{
+			input:  execPlan.Input,
+			chunks: []string{filepath.Join(tempDir, "chunk-0.m4a"), filepath.Join(tempDir, "chunk-1.m4a")},
+		},
+		stubPlanner{execPlan: execPlan},
+		provider,
+		passthroughOptimizer{},
+		noopPostprocessor{},
+		testLogger(),
+		recorder,
+	)
+
+	resultCh := make(chan error, 1)
+	go func() {
+		_, _, err := svc.Transcribe(context.Background(), spec)
+		resultCh <- err
+	}()
+
+	for i := 0; i < 2; i++ {
+		select {
+		case <-provider.started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("expected both mini chunk requests to start")
+		}
+	}
+	close(provider.release)
+
+	select {
+	case err := <-resultCh:
+		if err != nil {
+			t.Fatalf("Transcribe() error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Transcribe() did not finish")
+	}
+
+	var manifest domain.Manifest
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%s) error = %v", manifestPath, err)
+	}
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		t.Fatalf("manifest JSON error = %v", err)
+	}
+	if manifest.Plan.ChunkExecutionMode != chunkExecutionParallel {
+		t.Fatalf("chunk execution mode = %q, want %q", manifest.Plan.ChunkExecutionMode, chunkExecutionParallel)
+	}
+	if !slices.Contains(recorder.warningCodes(), "parallel_prompt_carryover_disabled") {
+		t.Fatalf("expected carryover warning, got %#v", recorder.warningCodes())
+	}
+	if !containsWarning(manifest.Warnings, "parallel_prompt_carryover_disabled") {
+		t.Fatalf("expected manifest warning, got %#v", manifest.Warnings)
+	}
+}
+
+func TestTranscribeParallelNoEffectFallsBackToSingleRequest(t *testing.T) {
+	t.Parallel()
+
+	tempDir := t.TempDir()
+	outputPath := filepath.Join(tempDir, "out.json")
+	manifestPath := filepath.Join(tempDir, "out.manifest.json")
+	spec := domain.JobSpec{
+		JobID:         "job-parallel-noop",
+		InputPath:     filepath.Join(tempDir, "input.mp3"),
+		OutputPath:    outputPath,
+		Format:        domain.FormatJSON,
+		Model:         "gpt-4o-transcribe",
+		Parallel:      true,
+		Overwrite:     true,
+		WriteManifest: true,
+	}
+	execPlan := plan.ExecutionPlan{
+		Input:                 domain.InputInfo{Path: spec.InputPath, SizeBytes: 1024, DurationSec: 30, HasAudio: true},
+		ChunkingMode:          domain.ChunkingOff,
+		ResponseFormat:        "json",
+		SingleRequestPossible: true,
+		Artifacts: []domain.Artifact{{
+			Path:         outputPath,
+			Format:       domain.FormatJSON,
+			ManifestPath: manifestPath,
+		}},
+	}
+	recorder := &recordingEvents{}
+	svc := New(
+		stubMediaService{input: execPlan.Input},
+		stubPlanner{execPlan: execPlan},
+		&sequenceProvider{
+			responses: []domain.ProviderResponse{{
+				Transcript: domain.Transcript{Version: domain.SchemaVersion, ModelUsed: "gpt-4o-transcribe", Language: "ja", Text: "done"},
+			}},
+		},
+		passthroughOptimizer{},
+		noopPostprocessor{},
+		testLogger(),
+		recorder,
+	)
+
+	if _, _, err := svc.Transcribe(context.Background(), spec); err != nil {
+		t.Fatalf("Transcribe() error = %v", err)
+	}
+
+	if !slices.Contains(recorder.warningCodes(), "parallel_no_effect") {
+		t.Fatalf("expected no-op warning, got %#v", recorder.warningCodes())
+	}
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%s) error = %v", manifestPath, err)
+	}
+	var manifest domain.Manifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		t.Fatalf("manifest JSON error = %v", err)
+	}
+	if manifest.Plan.ChunkExecutionMode != chunkExecutionSerial {
+		t.Fatalf("chunk execution mode = %q, want %q", manifest.Plan.ChunkExecutionMode, chunkExecutionSerial)
+	}
+}
+
+func TestTranscribeParallelCancelsSiblingWorkersOnFailure(t *testing.T) {
+	t.Parallel()
+
+	tempDir := t.TempDir()
+	outputPath := filepath.Join(tempDir, "out.txt")
+	spec := domain.JobSpec{
+		JobID:         "job-parallel-cancel",
+		InputPath:     filepath.Join(tempDir, "input.mp3"),
+		OutputPath:    outputPath,
+		Format:        domain.FormatTXT,
+		Model:         "gpt-4o-transcribe",
+		ChunkingMode:  domain.ChunkingClient,
+		Parallel:      true,
+		Overwrite:     true,
+		WriteManifest: false,
+	}
+	execPlan := plan.ExecutionPlan{
+		Input:          domain.InputInfo{Path: spec.InputPath, SizeBytes: 40 << 20, DurationSec: 900, HasAudio: true},
+		ChunkingMode:   domain.ChunkingClient,
+		ResponseFormat: "json",
+		Artifacts:      []domain.Artifact{{Path: outputPath, Format: domain.FormatTXT}},
+		Chunks: []domain.ChunkPlan{
+			{Index: 0, StartSec: 0, EndSec: 300, OverlapSec: 30, PromptCarryover: true},
+			{Index: 1, StartSec: 270, EndSec: 600, OverlapSec: 30, PromptCarryover: true},
+			{Index: 2, StartSec: 570, EndSec: 900, OverlapSec: 30, PromptCarryover: true},
+		},
+	}
+	provider := &cancelAwareParallelProvider{
+		started: make(chan int, 3),
+		release: make(chan struct{}),
+		success: domain.ProviderResponse{
+			Transcript: domain.Transcript{Version: domain.SchemaVersion, ModelUsed: "gpt-4o-transcribe", Language: "ja", Text: "first chunk"},
+		},
+	}
+	svc := New(
+		stubMediaService{
+			input:  execPlan.Input,
+			chunks: []string{filepath.Join(tempDir, "chunk-0.m4a"), filepath.Join(tempDir, "chunk-1.m4a"), filepath.Join(tempDir, "chunk-2.m4a")},
+		},
+		stubPlanner{execPlan: execPlan},
+		provider,
+		passthroughOptimizer{},
+		noopPostprocessor{},
+		testLogger(),
+		events.NopWriter{},
+	)
+
+	resultCh := make(chan struct {
+		artifacts []domain.Artifact
+		err       error
+	}, 1)
+	go func() {
+		artifacts, _, err := svc.Transcribe(context.Background(), spec)
+		resultCh <- struct {
+			artifacts []domain.Artifact
+			err       error
+		}{artifacts: artifacts, err: err}
+	}()
+
+	for i := 0; i < defaultParallelWorkers; i++ {
+		select {
+		case <-provider.started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("expected initial worker pool to fill")
+		}
+	}
+	select {
+	case <-provider.started:
+		t.Fatal("expected dispatcher to stop before scheduling extra chunks")
+	case <-time.After(150 * time.Millisecond):
+	}
+	close(provider.release)
+
+	var result struct {
+		artifacts []domain.Artifact
+		err       error
+	}
+	select {
+	case result = <-resultCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Transcribe() did not finish")
+	}
+	artifacts, err := result.artifacts, result.err
+	if err == nil {
+		t.Fatal("expected partial error")
+	}
+	if domain.ExitCode(err) != domain.ExitPartial {
+		t.Fatalf("expected ExitPartial, got %d (%v)", domain.ExitCode(err), err)
+	}
+	if provider.cancelCount() == 0 {
+		t.Fatal("expected sibling workers to observe context cancellation")
+	}
+	if provider.requestCount() != defaultParallelWorkers {
+		t.Fatalf("expected dispatcher to stop at %d requests, got %d", defaultParallelWorkers, provider.requestCount())
+	}
+	if len(artifacts) != 1 || !artifacts[0].Partial {
+		t.Fatalf("expected partial artifact, got %#v", artifacts)
 	}
 }
 
@@ -1092,6 +1565,173 @@ func TestTranscribeResumeSkipsCompletedClientChunks(t *testing.T) {
 	}
 }
 
+func TestTranscribeResumeRejectsParallelToSerialModeMismatch(t *testing.T) {
+	t.Parallel()
+
+	tempDir := t.TempDir()
+	outputPath := filepath.Join(tempDir, "meeting.transcript.txt")
+	manifestPath := filepath.Join(tempDir, "meeting.transcript.manifest.json")
+	spec := domain.JobSpec{
+		JobID:         "job-resume-parallel",
+		InputPath:     filepath.Join(tempDir, "meeting.mp3"),
+		OutputPath:    outputPath,
+		Format:        domain.FormatTXT,
+		Model:         "gpt-4o-transcribe",
+		ChunkingMode:  domain.ChunkingClient,
+		Parallel:      true,
+		Overwrite:     true,
+		WriteManifest: true,
+	}
+	execPlan := plan.ExecutionPlan{
+		Input:          domain.InputInfo{Path: spec.InputPath, SizeBytes: 30 << 20, DurationSec: 600, HasAudio: true},
+		ChunkingMode:   domain.ChunkingClient,
+		ResponseFormat: "json",
+		Artifacts: []domain.Artifact{{
+			Path:         outputPath,
+			Format:       domain.FormatTXT,
+			ManifestPath: manifestPath,
+		}},
+		Chunks: []domain.ChunkPlan{
+			{Index: 0, StartSec: 0, EndSec: 300, OverlapSec: 30, PromptCarryover: true},
+			{Index: 1, StartSec: 270, EndSec: 600, OverlapSec: 30, PromptCarryover: true},
+		},
+	}
+	firstProvider := &scriptedProvider{
+		responses: []domain.ProviderResponse{{
+			Transcript: domain.Transcript{Version: domain.SchemaVersion, ModelUsed: "gpt-4o-transcribe", Language: "ja", Text: "first chunk"},
+		}},
+		errors: []error{nil, domain.NewError("network_error", "network error", domain.ExitNetwork, nil)},
+	}
+	firstSvc := New(
+		stubMediaService{
+			input:  execPlan.Input,
+			chunks: []string{filepath.Join(tempDir, "chunk-0.m4a"), filepath.Join(tempDir, "chunk-1.m4a")},
+		},
+		stubPlanner{execPlan: execPlan},
+		firstProvider,
+		passthroughOptimizer{},
+		noopPostprocessor{},
+		testLogger(),
+		events.NopWriter{},
+	)
+
+	if _, _, err := firstSvc.Transcribe(context.Background(), spec); err == nil || domain.ExitCode(err) != domain.ExitPartial {
+		t.Fatalf("expected partial error on first run, got %v", err)
+	}
+
+	resumeSpec := spec
+	resumeSpec.JobID = "job-resume-parallel-second"
+	resumeSpec.Resume = true
+	resumeSpec.Parallel = false
+	secondProvider := &sequenceProvider{}
+	secondSvc := New(
+		stubMediaService{
+			input:  execPlan.Input,
+			chunks: []string{filepath.Join(tempDir, "chunk-0.m4a"), filepath.Join(tempDir, "chunk-1.m4a")},
+		},
+		stubPlanner{execPlan: execPlan},
+		secondProvider,
+		passthroughOptimizer{},
+		noopPostprocessor{},
+		testLogger(),
+		events.NopWriter{},
+	)
+
+	_, _, err := secondSvc.Transcribe(context.Background(), resumeSpec)
+	if err == nil {
+		t.Fatal("expected resume mismatch error")
+	}
+	if domain.ErrorCode(err) != "resume_manifest_mismatch" {
+		t.Fatalf("unexpected error code: %s", domain.ErrorCode(err))
+	}
+	if len(secondProvider.requests) != 0 {
+		t.Fatalf("expected resume validation to fail before provider calls, got %d requests", len(secondProvider.requests))
+	}
+}
+
+func TestTranscribeResumeRejectsSerialToParallelModeMismatch(t *testing.T) {
+	t.Parallel()
+
+	tempDir := t.TempDir()
+	outputPath := filepath.Join(tempDir, "meeting.transcript.txt")
+	manifestPath := filepath.Join(tempDir, "meeting.transcript.manifest.json")
+	spec := domain.JobSpec{
+		JobID:         "job-resume-serial",
+		InputPath:     filepath.Join(tempDir, "meeting.mp3"),
+		OutputPath:    outputPath,
+		Format:        domain.FormatTXT,
+		Model:         "gpt-4o-transcribe",
+		ChunkingMode:  domain.ChunkingClient,
+		Overwrite:     true,
+		WriteManifest: true,
+	}
+	execPlan := plan.ExecutionPlan{
+		Input:          domain.InputInfo{Path: spec.InputPath, SizeBytes: 30 << 20, DurationSec: 600, HasAudio: true},
+		ChunkingMode:   domain.ChunkingClient,
+		ResponseFormat: "json",
+		Artifacts: []domain.Artifact{{
+			Path:         outputPath,
+			Format:       domain.FormatTXT,
+			ManifestPath: manifestPath,
+		}},
+		Chunks: []domain.ChunkPlan{
+			{Index: 0, StartSec: 0, EndSec: 300, OverlapSec: 30, PromptCarryover: true},
+			{Index: 1, StartSec: 270, EndSec: 600, OverlapSec: 30, PromptCarryover: true},
+		},
+	}
+	firstProvider := &scriptedProvider{
+		responses: []domain.ProviderResponse{{
+			Transcript: domain.Transcript{Version: domain.SchemaVersion, ModelUsed: "gpt-4o-transcribe", Language: "ja", Text: "first chunk"},
+		}},
+		errors: []error{nil, domain.NewError("network_error", "network error", domain.ExitNetwork, nil)},
+	}
+	firstSvc := New(
+		stubMediaService{
+			input:  execPlan.Input,
+			chunks: []string{filepath.Join(tempDir, "chunk-0.m4a"), filepath.Join(tempDir, "chunk-1.m4a")},
+		},
+		stubPlanner{execPlan: execPlan},
+		firstProvider,
+		passthroughOptimizer{},
+		noopPostprocessor{},
+		testLogger(),
+		events.NopWriter{},
+	)
+
+	if _, _, err := firstSvc.Transcribe(context.Background(), spec); err == nil || domain.ExitCode(err) != domain.ExitPartial {
+		t.Fatalf("expected partial error on first run, got %v", err)
+	}
+
+	resumeSpec := spec
+	resumeSpec.JobID = "job-resume-serial-second"
+	resumeSpec.Resume = true
+	resumeSpec.Parallel = true
+	secondProvider := &sequenceProvider{}
+	secondSvc := New(
+		stubMediaService{
+			input:  execPlan.Input,
+			chunks: []string{filepath.Join(tempDir, "chunk-0.m4a"), filepath.Join(tempDir, "chunk-1.m4a")},
+		},
+		stubPlanner{execPlan: execPlan},
+		secondProvider,
+		passthroughOptimizer{},
+		noopPostprocessor{},
+		testLogger(),
+		events.NopWriter{},
+	)
+
+	_, _, err := secondSvc.Transcribe(context.Background(), resumeSpec)
+	if err == nil {
+		t.Fatal("expected resume mismatch error")
+	}
+	if domain.ErrorCode(err) != "resume_manifest_mismatch" {
+		t.Fatalf("unexpected error code: %s", domain.ErrorCode(err))
+	}
+	if len(secondProvider.requests) != 0 {
+		t.Fatalf("expected resume validation to fail before provider calls, got %d requests", len(secondProvider.requests))
+	}
+}
+
 func TestTranscribeResumeRequiresExistingManifest(t *testing.T) {
 	t.Parallel()
 
@@ -1150,4 +1790,13 @@ func containsAll(text string, needles ...string) bool {
 		}
 	}
 	return true
+}
+
+func containsWarning(warnings []domain.Warning, code string) bool {
+	for _, warning := range warnings {
+		if warning.Code == code {
+			return true
+		}
+	}
+	return false
 }

@@ -8,7 +8,7 @@ import (
 
 // These values are expected to be overridden via -ldflags in release builds.
 var (
-	Version = "0.2.0"
+	Version = "0.3.0"
 	Commit  = "unknown"
 	Date    = ""
 )

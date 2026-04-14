@@ -2,8 +2,15 @@
 
 ## Unreleased
 
+## v0.3.0
+
+- Add `--parallel` client-chunk sending for `gpt-4o-transcribe` and `gpt-4o-mini-transcribe`.
+- Keep sequential execution as the default and emit explicit warnings when parallel mode disables prompt carryover.
+- Record client chunk execution mode in manifests and require `--resume` runs to match the original sequential vs. parallel mode.
+- Treat `--parallel` as a no-op for single-request or server-chunked plans rather than failing the job.
 - Add resumable client-chunked transcription via manifest-backed chunk caches.
 - Default `--retries` to `1` for retryable provider failures and reset input streams correctly before retry.
+- Refresh README and contract/config documentation for parallel chunking and resume behavior.
 
 ## v0.2.0
 

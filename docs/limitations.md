@@ -25,7 +25,8 @@ This document summarizes current implementation limits and the main areas still 
 
 - optimized for transcript text quality
 - use longer client chunk windows
-- rely on sequential execution plus prompt carryover
+- default to sequential execution plus prompt carryover
+- optional `--parallel` works only for client-chunked runs and trades prompt carryover for speed
 - may preserve mixed-language output more faithfully than a normalized monolingual transcript
 
 ### `gpt-4o-transcribe-diarize`
@@ -40,6 +41,7 @@ This document summarizes current implementation limits and the main areas still 
 
 - if `ffmpeg` or `ffprobe` is missing, some input types and chunking paths will not work
 - with `--overwrite=false`, existing transcript, manifest, and raw provider JSON outputs are preserved
+- resumable client-chunked runs must keep the same sequential vs. parallel execution mode
 - GUIs and automation are expected to rely on the contracts in `docs/contracts.md` for events, manifests, and exit codes
 
 ## Planned Improvement Areas

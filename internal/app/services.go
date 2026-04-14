@@ -57,6 +57,12 @@ type Services struct {
 	Events      events.Writer
 }
 
+const (
+	defaultParallelWorkers = 3
+	chunkExecutionSerial   = "serial"
+	chunkExecutionParallel = "parallel"
+)
+
 func New(mediaSvc MediaService, planner Planner, provider Provider, optimizer BoundaryOptimizer, post Postprocessor, logger *logging.Logger, eventWriter events.Writer) *Services {
 	return &Services{Media: mediaSvc, Planner: planner, Provider: provider, Optimizer: optimizer, Postprocess: post, Logger: logger, Events: eventWriter}
 }
@@ -232,6 +238,15 @@ func (s *Services) Transcribe(ctx context.Context, spec domain.JobSpec) (artifac
 	var runtimeWarnings []domain.Warning
 	var resumeStore *chunkResumeStore
 	knownSpeakerNames := speakerReferenceNames(spec.SpeakerRefs)
+	emitRuntimeWarning := func(code, message string) {
+		warning := domain.Warning{Code: code, Message: message}
+		runtimeWarnings = domain.AppendWarning(runtimeWarnings, warning)
+		_ = s.Events.Emit("warning", map[string]any{"code": warning.Code, "message": warning.Message})
+		s.Logger.Warn("transcription warning", map[string]any{"code": warning.Code, "message": warning.Message})
+	}
+	if spec.Parallel && chunkExecutionMode(spec, execPlan) == chunkExecutionSerial {
+		emitRuntimeWarning("parallel_no_effect", "parallel chunk sending has no effect for the current execution plan; proceeding normally")
+	}
 	if execPlan.ChunkingMode == domain.ChunkingClient && len(execPlan.Chunks) > 0 {
 		_ = s.Events.Emit("stage.started", map[string]any{"stage": domain.StageNormalizing, "message": "creating client chunks"})
 		normalizeStarted := time.Now()
@@ -250,9 +265,7 @@ func (s *Services) Transcribe(ctx context.Context, spec domain.JobSpec) (artifac
 				chunkPlan = optimized
 			}
 			for _, warning := range chunkWarnings {
-				runtimeWarnings = domain.AppendWarning(runtimeWarnings, warning)
-				_ = s.Events.Emit("warning", map[string]any{"code": warning.Code, "message": warning.Message})
-				s.Logger.Warn("chunk preparation warning", map[string]any{"code": warning.Code, "message": warning.Message})
+				emitRuntimeWarning(warning.Code, warning.Message)
 			}
 		}
 		if spec.WriteManifest {
@@ -303,7 +316,14 @@ func (s *Services) Transcribe(ctx context.Context, spec domain.JobSpec) (artifac
 				completedChunks++
 			}
 		}
-		if isWhisperParallel(spec) {
+		profile, _ := domain.ModelProfileFor(spec.Model)
+		useParallel := shouldRunParallel(spec, execPlan)
+		useLegacyParallel := useParallel && profile.ParallelChunking
+		useBoundedParallel := useParallel && !profile.ParallelChunking
+		if useBoundedParallel {
+			emitRuntimeWarning("parallel_prompt_carryover_disabled", "parallel chunk sending disables prompt carryover for this model")
+		}
+		if useLegacyParallel {
 			var (
 				wg        sync.WaitGroup
 				mu        sync.Mutex
@@ -355,6 +375,88 @@ func (s *Services) Transcribe(ctx context.Context, spec domain.JobSpec) (artifac
 						}
 					}
 					okChunks[i] = true
+					completed++
+					_ = s.Events.Emit("chunk.completed", map[string]any{"chunk_index": i})
+					_ = s.Events.Emit("stage.progress", map[string]any{
+						"stage":         domain.StageTranscribing,
+						"progress":      float64(completed) / float64(len(chunkPaths)),
+						"current_chunk": completed,
+						"total_chunks":  len(chunkPaths),
+						"message":       fmt.Sprintf("sending chunk %d/%d", completed, len(chunkPaths)),
+					})
+				}()
+			}
+			wg.Wait()
+			if firstErr != nil {
+				filteredTranscripts, filteredPlans := filterSuccessfulChunks(transcripts, mergePlans)
+				return s.handlePartial(ctx, spec, filteredTranscripts, filteredPlans, execPlan, timings, firstErr)
+			}
+		} else if useBoundedParallel {
+			parallelCtx, cancelParallel := context.WithCancel(ctx)
+			defer cancelParallel()
+			var (
+				wg        sync.WaitGroup
+				mu        sync.Mutex
+				firstErr  error
+				completed = completedChunks
+				sem       = make(chan struct{}, defaultParallelWorkers)
+			)
+		dispatchLoop:
+			for i, chunkPath := range chunkPaths {
+				if resumeStore != nil && resumeStore.hasCompletedChunk(i) {
+					continue
+				}
+				select {
+				case <-parallelCtx.Done():
+					break dispatchLoop
+				case sem <- struct{}{}:
+				}
+				if parallelCtx.Err() != nil {
+					<-sem
+					break
+				}
+				i, chunkPath := i, chunkPath
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					defer func() { <-sem }()
+
+					chunkSpec := spec
+					_ = s.Events.Emit("chunk.started", map[string]any{"chunk_index": i, "path": chunkPath})
+					resp, transcribeErr := s.Provider.Transcribe(parallelCtx, domain.ProviderRequest{
+						Spec:           chunkSpec,
+						FilePath:       chunkPath,
+						ResponseFormat: execPlan.ResponseFormat,
+					})
+
+					mu.Lock()
+					defer mu.Unlock()
+					if transcribeErr != nil {
+						if firstErr == nil {
+							firstErr = transcribeErr
+							cancelParallel()
+						}
+						return
+					}
+					transcripts[i] = merge.PrepareChunkTranscript(merge.ChunkPreparationOptions{
+						Model:                      spec.Model,
+						ChunkIndex:                 i,
+						TotalChunks:                len(chunkPaths),
+						AllowExperimentalStitching: spec.AllowExperimentalDiarizeStitching,
+						KnownSpeakerNames:          knownSpeakerNames,
+					}, resp.Transcript)
+					rawJSONs[i] = resp.RawJSON
+					if resumeStore != nil {
+						checkpointTimings := timings
+						checkpointTimings.Transcribe = time.Since(transcribeStarted).Milliseconds()
+						if saveErr := resumeStore.saveChunk(i, transcripts[i], rawJSONs[i], checkpointTimings); saveErr != nil {
+							if firstErr == nil {
+								firstErr = saveErr
+								cancelParallel()
+							}
+							return
+						}
+					}
 					completed++
 					_ = s.Events.Emit("chunk.completed", map[string]any{"chunk_index": i})
 					_ = s.Events.Emit("stage.progress", map[string]any{
@@ -658,9 +760,25 @@ func ctxCancelled(ctx context.Context, err error) bool {
 	return errors.Is(ctx.Err(), context.Canceled) || errors.Is(err, context.Canceled)
 }
 
-func isWhisperParallel(spec domain.JobSpec) bool {
+func shouldRunParallel(spec domain.JobSpec, execPlan plan.ExecutionPlan) bool {
+	if execPlan.ChunkingMode != domain.ChunkingClient {
+		return false
+	}
 	profile, ok := domain.ModelProfileFor(spec.Model)
-	return ok && profile.ParallelChunking
+	if ok && profile.ParallelChunking {
+		return true
+	}
+	return spec.Parallel
+}
+
+func chunkExecutionMode(spec domain.JobSpec, execPlan plan.ExecutionPlan) string {
+	if execPlan.ChunkingMode != domain.ChunkingClient || len(execPlan.Chunks) == 0 {
+		return chunkExecutionSerial
+	}
+	if shouldRunParallel(spec, execPlan) {
+		return chunkExecutionParallel
+	}
+	return chunkExecutionSerial
 }
 
 func filterSuccessfulChunks(transcripts []domain.Transcript, plans []domain.ChunkPlan) ([]domain.Transcript, []domain.ChunkPlan) {

@@ -209,6 +209,7 @@ func buildChunkManifest(spec domain.JobSpec, execPlan plan.ExecutionPlan, artifa
 func manifestPlanSummary(spec domain.JobSpec, execPlan plan.ExecutionPlan) domain.PlanSummary {
 	return domain.PlanSummary{
 		ChunkingMode:                      execPlan.ChunkingMode,
+		ChunkExecutionMode:                chunkExecutionMode(spec, execPlan),
 		Model:                             spec.Model,
 		Language:                          spec.Language,
 		Format:                            spec.Format,
@@ -284,6 +285,9 @@ func validateResumeManifest(manifest domain.Manifest, spec domain.JobSpec, execP
 	}
 	if manifest.Plan.AllowExperimentalDiarizeStitching != spec.AllowExperimentalDiarizeStitching {
 		return resumeMismatch("experimental diarize stitching")
+	}
+	if manifest.Plan.ChunkExecutionMode != "" && manifest.Plan.ChunkExecutionMode != chunkExecutionMode(spec, execPlan) {
+		return resumeMismatch("chunk execution mode")
 	}
 	if len(manifest.Chunks) != len(chunkPlan) {
 		return resumeMismatch("chunk plan")

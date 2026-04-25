@@ -1,7 +1,64 @@
+# Build and release artifacts
 /transcriber
-dist/
+/dist/
+
+# Local fixtures and scratch data
 /testdata/
-coverage.out
+/tmp/
+
+# Local agent instructions / private workspace notes
+AGENTS.md
+AGENTS.local.md
+CLAUDE.md
+CLAUDE.local.md
+/.claude/
+/.codex/
+
+# Secrets and local runtime configuration
+.env
+.env.*
+!.env.example
+!.env.sample
+.envrc
+/.direnv/
+/config.toml
+/config.*.toml
+/key.txt
+*.pem
+*.p12
+*.pfx
+*.key
+
+# Generated transcription outputs
+*.transcript.md
+*.transcript.txt
+*.transcript.json
+*.transcript.srt
+*.transcript.vtt
+*.transcript.manifest.json
+*.transcript.partial.md
+*.transcript.partial.txt
+*.transcript.partial.json
+*.transcript.partial.srt
+*.transcript.partial.vtt
+*.partial.md
+*.partial.txt
+*.partial.json
+*.partial.srt
+*.partial.vtt
+*.manifest.json
+*.chunks/
+*.raw.json
+raw-provider.json
+events.jsonl
+*.events.jsonl
 /Recording *.m4a
+
+# Logs, profiles, and local OS/editor noise
+coverage.out
+*.prof
+*.trace
+*.log
+*.test
 .DS_Store
 /.git-backup-*/

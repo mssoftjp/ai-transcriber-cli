@@ -40,7 +40,14 @@ Windows: download from [ffmpeg.org/download.html](https://ffmpeg.org/download.ht
 export OPENAI_API_KEY="sk-..."
 ```
 
-The CLI reads the API key only from environment variables. It never writes keys to config files, log files, or transcript output. Audio data is sent to the OpenAI API for transcription and is subject to [OpenAI's data usage policies](https://openai.com/policies/usage-policies). No audio or transcript data is sent anywhere else.
+You can also store the key in the OS keychain:
+
+```sh
+printf '%s' "$OPENAI_API_KEY" | transcriber config key set --method keychain --stdin
+transcriber config key status
+```
+
+The CLI resolves the API key from the configured `[api].key_env`, then `OPENAI_API_KEY`, then the OS keychain, and finally an optional local key file at the same config location (`key.txt`). It never writes keys to config files, log files, or transcript output. Audio data is sent to the OpenAI API for transcription and is subject to [OpenAI's data usage policies](https://openai.com/policies/usage-policies). No audio or transcript data is sent anywhere else.
 
 ### Verify
 
@@ -171,6 +178,15 @@ transcriber transcribe input.m4a --events jsonl > events.jsonl
 
 Emits machine-readable JSONL progress events to stdout. Designed for GUI wrappers and automation pipelines.
 
+### Interactive TUI
+
+```sh
+transcriber tui
+```
+
+The TUI is a helper for one-off local jobs. The batch CLI remains the primary interface for scripts, redirected output, and full option coverage.
+Use arrow keys or `j`/`k` to move, `Enter` to select or edit, `s` to start from the job screen, and `Esc` to go back or quit.
+
 ## Configuration
 
 A TOML config file lets you persist frequently used options as defaults.
@@ -199,6 +215,7 @@ See [docs/config.md](docs/config.md) for the full reference.
 | `transcriber transcribe <input>` | Run transcription |
 | `transcriber probe <input>` | Inspect input and return the execution plan |
 | `transcriber doctor` | Check environment (API key, dependencies) |
+| `transcriber tui` | Open the interactive terminal UI for a single job |
 | `transcriber version` | Print version metadata |
 | `transcriber config init` | Print a sample config |
 | `transcriber config validate` | Validate config and dictionary |
@@ -239,13 +256,13 @@ make build
 Build a versioned release archive plus `checksums.txt`:
 
 ```sh
-make package VERSION=v0.3.0
+make package VERSION=v0.4.0
 ```
 
 Build a cross-target release archive:
 
 ```sh
-make release-archive VERSION=v0.3.0 GOOS=darwin GOARCH=arm64
+make release-archive VERSION=v0.4.0 GOOS=darwin GOARCH=arm64
 ```
 
 Packaging notes:

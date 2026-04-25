@@ -68,19 +68,6 @@ func (s *chunkResumeStore) hasCompletedChunk(i int) bool {
 	return s.manifest.Chunks[i].Status == domain.ChunkCompleted
 }
 
-func (s *chunkResumeStore) completedCount() int {
-	if s == nil {
-		return 0
-	}
-	count := 0
-	for _, chunk := range s.manifest.Chunks {
-		if chunk.Status == domain.ChunkCompleted {
-			count++
-		}
-	}
-	return count
-}
-
 func (s *chunkResumeStore) loadChunk(i int) (domain.Transcript, string, error) {
 	if s == nil || i < 0 || i >= len(s.manifest.Chunks) {
 		return domain.Transcript{}, "", domain.NewError("resume_chunk_invalid", "resume chunk index is invalid", domain.ExitInput, nil)

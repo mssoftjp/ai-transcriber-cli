@@ -9,9 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"path/filepath"
 	"runtime/debug"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -24,11 +22,13 @@ import (
 	"ai-transcriber-cli/internal/config"
 	"ai-transcriber-cli/internal/domain"
 	"ai-transcriber-cli/internal/events"
+	"ai-transcriber-cli/internal/keystore"
 	"ai-transcriber-cli/internal/logging"
 	"ai-transcriber-cli/internal/media"
 	"ai-transcriber-cli/internal/plan"
 	"ai-transcriber-cli/internal/postprocess"
 	openaip "ai-transcriber-cli/internal/provider/openai"
+	"ai-transcriber-cli/internal/specbuilder"
 	"ai-transcriber-cli/internal/vad"
 )
 
@@ -91,7 +91,7 @@ Run "transcriber transcribe --help" for full flag reference.
 		},
 	}
 	root.PersistentFlags().StringVar(&state.cfgPath, "config", "", "config file path")
-	root.AddCommand(newTranscribeCmd(state), newProbeCmd(state), newDoctorCmd(state), newVersionCmd(), newConfigCmd(state))
+	root.AddCommand(newTranscribeCmd(state), newProbeCmd(state), newDoctorCmd(state), newVersionCmd(), newConfigCmd(state), newTUICmd(state))
 	root.SetOut(stdout)
 	root.SetErr(stderr)
 	return root
@@ -137,13 +137,17 @@ Supported input extensions:
 			if err != nil {
 				return err
 			}
-			keyEnv := valueOr(spec.APIKeyEnv, "OPENAI_API_KEY")
-			if !spec.DryRun && os.Getenv(keyEnv) == "" {
+			key, err := resolveAPIKey(state.cfg)
+			if err != nil {
+				return domain.NewError("api_key_resolve_failed", "failed to resolve API key", domain.ExitAuth, err)
+			}
+			if !spec.DryRun && key.Value == "" {
+				keyEnv := valueOr(key.EnvName, "OPENAI_API_KEY")
 				message := fmt.Sprintf("%s is required. Export it first, then re-run the command. Example: export %s=\"sk-...\"", keyEnv, keyEnv)
 				return domain.NewError("missing_api_key", message, domain.ExitAuth, nil)
 			}
 			state.spec = spec
-			services, ctx, cancel, err := buildServices(spec)
+			services, ctx, cancel, err := buildServices(spec, key.Value)
 			if err != nil {
 				return err
 			}
@@ -229,7 +233,7 @@ For GUIs and AI wrappers, it is safest to call probe before starting a real tran
 			if err != nil {
 				return err
 			}
-			services, ctx, cancel, err := buildServices(spec)
+			services, ctx, cancel, err := buildServices(spec, "")
 			if err != nil {
 				return err
 			}
@@ -273,13 +277,17 @@ Doctor performs a connectivity check against the configured provider when creden
 			if err != nil {
 				return err
 			}
-			services, ctx, cancel, err := buildServices(spec)
+			key, err := resolveAPIKey(state.cfg)
+			if err != nil {
+				return domain.NewError("api_key_resolve_failed", "failed to resolve API key", domain.ExitAuth, err)
+			}
+			services, ctx, cancel, err := buildServices(spec, key.Value)
 			if err != nil {
 				return err
 			}
 			defer cancel()
 
-			result, err := services.Doctor(ctx, spec, os.Getenv(state.cfg.API.KeyEnv))
+			result, err := services.Doctor(ctx, spec, key.Value, key.Source)
 			if err != nil {
 				return err
 			}
@@ -423,8 +431,80 @@ This is useful as a sanity check before execution in CI or AI wrappers.
 			return nil
 		},
 	}
-	configCmd.AddCommand(initCmd, validateCmd)
+	configCmd.AddCommand(initCmd, validateCmd, newConfigKeyCmd(state))
 	return configCmd
+}
+
+func newConfigKeyCmd(state *cliState) *cobra.Command {
+	keyCmd := &cobra.Command{
+		Use:   "key",
+		Short: "Manage stored API keys",
+		Long: strings.TrimSpace(`
+Manage stored API keys without writing secret values to config.toml.
+
+Resolution order is configured env, OPENAI_API_KEY, keychain, then file.
+`),
+	}
+
+	statusCmd := &cobra.Command{
+		Use:   "status",
+		Short: "Show API key resolution status",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			result, err := resolveAPIKey(state.cfg)
+			if err != nil {
+				return domain.NewError("api_key_resolve_failed", "failed to resolve API key", domain.ExitAuth, err)
+			}
+			payload := map[string]any{
+				"found":        result.Value != "",
+				"source":       result.Source,
+				"env_name":     result.EnvName,
+				"override_env": result.OverrideEnv,
+				"file_path":    keystore.DefaultFileStore{}.Path(state.cfg),
+			}
+			data, _ := json.MarshalIndent(payload, "", "  ")
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), string(data))
+			return nil
+		},
+	}
+
+	var setMethod string
+	var setValue string
+	var valueStdin bool
+	setCmd := &cobra.Command{
+		Use:   "set",
+		Short: "Store an API key in keychain or file storage",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			value, err := keyValueForSet(state.cfg, setValue, valueStdin, cmd.InOrStdin())
+			if err != nil {
+				return err
+			}
+			if err := defaultKeyResolver().SaveAPIKey(state.cfg, setMethod, value); err != nil {
+				return domain.NewError("api_key_save_failed", "failed to save API key", domain.ExitConfig, err)
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "saved API key to %s\n", setMethod)
+			return nil
+		},
+	}
+	setCmd.Flags().StringVar(&setMethod, "method", keystore.SourceKeychain, "storage method: keychain or file")
+	setCmd.Flags().StringVar(&setValue, "value", "", "API key value; prefer --stdin to avoid shell history")
+	setCmd.Flags().BoolVar(&valueStdin, "stdin", false, "read API key from stdin")
+
+	var deleteMethod string
+	deleteCmd := &cobra.Command{
+		Use:   "delete",
+		Short: "Delete a stored API key",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if err := defaultKeyResolver().DeleteAPIKey(state.cfg, deleteMethod); err != nil && !errors.Is(err, keystore.ErrNotFound) {
+				return domain.NewError("api_key_delete_failed", "failed to delete API key", domain.ExitConfig, err)
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "deleted API key from %s\n", deleteMethod)
+			return nil
+		},
+	}
+	deleteCmd.Flags().StringVar(&deleteMethod, "method", keystore.SourceKeychain, "storage method: keychain or file")
+
+	keyCmd.AddCommand(statusCmd, setCmd, deleteCmd)
+	return keyCmd
 }
 
 func addCommonTranscribeFlags(cmd *cobra.Command) {
@@ -476,163 +556,120 @@ func addCommonTranscribeFlags(cmd *cobra.Command) {
 }
 
 func buildSpec(cfg config.AppConfig, cmd *cobra.Command, input string) (domain.JobSpec, error) {
-	if input != "" {
-		abs, err := filepath.Abs(input)
-		if err != nil {
-			return domain.JobSpec{}, domain.NewError("input_path_invalid", "failed to resolve input path", domain.ExitInput, err)
-		}
-		input = abs
-	}
-	if _, err := logging.ParseLevel(getBool(cmd, "quiet"), getBool(cmd, "verbose")); err != nil {
-		return domain.JobSpec{}, domain.NewError("log_flags_conflict", err.Error(), domain.ExitArgs, err)
-	}
-
-	speakerRefs, err := parseSpeakerRefs(getStringArray(cmd, "speaker-ref"))
+	cwd, err := os.Getwd()
 	if err != nil {
-		return domain.JobSpec{}, err
+		return domain.JobSpec{}, domain.NewError("cwd_unavailable", "failed to resolve current directory", domain.ExitInput, err)
 	}
-
-	spec := domain.JobSpec{
-		JobID:                             valueOr(getString(cmd, "job-id"), app.GenerateJobID()),
-		APIKeyEnv:                         valueOr(cfg.API.KeyEnv, "OPENAI_API_KEY"),
+	return specbuilder.Build(specbuilder.Input{
 		InputPath:                         input,
 		OutputPath:                        getString(cmd, "out"),
 		OutputDir:                         getString(cmd, "out-dir"),
-		Format:                            parseFormat(valueOr(getString(cmd, "format"), string(cfg.Transcription.Format))),
-		Model:                             valueOr(getString(cmd, "model"), cfg.Transcription.Model),
-		Language:                          valueOr(getString(cmd, "language"), cfg.Transcription.Language),
-		Prompt:                            valueOr(getString(cmd, "prompt"), cfg.Transcription.Prompt),
-		Logprobs:                          boolValue(cmd, "logprobs", cfg.Transcription.Logprobs),
-		ChunkingMode:                      parseChunking(valueOr(getString(cmd, "chunking-mode"), string(cfg.Transcription.ChunkingMode))),
-		VADMode:                           parseVAD(valueOr(getString(cmd, "vad-mode"), string(cfg.Transcription.VADMode))),
-		DictionaryPath:                    valueOr(getString(cmd, "dictionary"), cfg.Dictionary.Path),
-		DictionaryEnabled:                 boolValue(cmd, "dictionary-enabled", cfg.Dictionary.Enabled),
-		Postprocess:                       boolValue(cmd, "postprocess", cfg.Postprocess.Enabled),
-		PostprocessModel:                  valueOr(getString(cmd, "postprocess-model"), cfg.Postprocess.Model),
-		PostprocessPrompt:                 valueOr(getString(cmd, "postprocess-prompt"), cfg.Postprocess.Prompt),
-		EventsMode:                        parseEvents(valueOr(getString(cmd, "events"), string(cfg.Events.Mode))),
-		LogFormat:                         parseLogFormat(valueOr(getString(cmd, "log-format"), string(cfg.Events.LogFormat))),
+		Format:                            getString(cmd, "format"),
+		Model:                             getString(cmd, "model"),
+		Language:                          getString(cmd, "language"),
+		Prompt:                            getString(cmd, "prompt"),
+		Logprobs:                          boolPtrIfChanged(cmd, "logprobs"),
+		Diarize:                           getBool(cmd, "diarize"),
+		ChunkingMode:                      getString(cmd, "chunking-mode"),
+		VADMode:                           getString(cmd, "vad-mode"),
+		DictionaryPath:                    getString(cmd, "dictionary"),
+		DictionaryEnabled:                 boolPtrIfChanged(cmd, "dictionary-enabled"),
+		Postprocess:                       boolPtrIfChanged(cmd, "postprocess"),
+		PostprocessModel:                  getString(cmd, "postprocess-model"),
+		PostprocessPrompt:                 getString(cmd, "postprocess-prompt"),
+		Start:                             getString(cmd, "start"),
+		End:                               getString(cmd, "end"),
+		EventsMode:                        getString(cmd, "events"),
 		Quiet:                             getBool(cmd, "quiet"),
 		Verbose:                           getBool(cmd, "verbose"),
-		FFmpegPath:                        valueOr(getString(cmd, "ffmpeg"), envOr("TRANSCRIBER_FFMPEG", cfg.Paths.FFmpeg)),
-		FFprobePath:                       valueOr(getString(cmd, "ffprobe"), envOr("TRANSCRIBER_FFPROBE", cfg.Paths.FFprobe)),
-		KeepWorkdir:                       boolValue(cmd, "keep-workdir", cfg.Paths.KeepWorkdir),
-		Workdir:                           valueOr(getString(cmd, "workdir"), cfg.Paths.Workdir),
+		LogFormat:                         getString(cmd, "log-format"),
+		JobID:                             getString(cmd, "job-id"),
+		FFmpegPath:                        getString(cmd, "ffmpeg"),
+		FFprobePath:                       getString(cmd, "ffprobe"),
+		KeepWorkdir:                       boolPtrIfChanged(cmd, "keep-workdir"),
+		Workdir:                           getString(cmd, "workdir"),
 		Resume:                            getBool(cmd, "resume"),
+		Parallel:                          getBool(cmd, "parallel"),
 		Timeout:                           getDuration(cmd, "timeout"),
 		Retries:                           getInt(cmd, "retries"),
-		Parallel:                          getBool(cmd, "parallel"),
-		PartialOutput:                     parsePartial(valueOr(getString(cmd, "partial-output"), string(cfg.Output.PartialOutput))),
-		Overwrite:                         boolValue(cmd, "overwrite", cfg.Output.Overwrite),
-		WriteManifest:                     boolValue(cmd, "write-manifest", cfg.Output.WriteManifest),
+		PartialOutput:                     getString(cmd, "partial-output"),
+		Overwrite:                         boolPtrIfChanged(cmd, "overwrite"),
+		WriteManifest:                     boolPtrIfChanged(cmd, "write-manifest"),
 		RawProviderJSONPath:               getString(cmd, "raw-provider-json"),
 		Stdout:                            getBool(cmd, "stdout"),
 		DryRun:                            getBool(cmd, "dry-run"),
 		IncludeSegments:                   getBool(cmd, "include-segments"),
 		AllowExperimentalDiarizeStitching: getBool(cmd, "allow-experimental-diarize-stitching"),
-		ServerVADThreshold:                firstFloat(getFloat(cmd, "server-vad-threshold"), cfg.ServerVAD.Threshold),
-		ServerVADPrefixMS:                 firstInt(getInt(cmd, "server-vad-prefix-ms"), cfg.ServerVAD.PrefixPaddingMS),
-		ServerVADSilenceMS:                firstInt(getInt(cmd, "server-vad-silence-ms"), cfg.ServerVAD.SilenceDurationMS),
-		SpeakerRefs:                       speakerRefs,
-	}
-	if cmd.Flags().Changed("chunk-target-sec") {
-		value := getFloat(cmd, "chunk-target-sec")
-		spec.ChunkTargetSecOverride = &value
-	}
-	if cmd.Flags().Changed("chunk-overlap-sec") {
-		value := getFloat(cmd, "chunk-overlap-sec")
-		spec.ChunkOverlapSecOverride = &value
-	}
-	if obsidianMode := getString(cmd, "obsidian-vad-mode"); obsidianMode != "" {
-		switch obsidianMode {
-		case "server":
-			spec.ChunkingMode = domain.ChunkingServerAuto
-			spec.VADMode = domain.VADDisabled
-		case "local":
-			spec.ChunkingMode = domain.ChunkingClient
-			spec.VADMode = domain.VADLocal
-		case "disabled":
-			spec.ChunkingMode = domain.ChunkingOff
-			spec.VADMode = domain.VADDisabled
-		}
-	}
-	if getBool(cmd, "diarize") {
-		spec.Model = "gpt-4o-transcribe-diarize"
-	}
-	if err := domain.ValidateModel(spec.Model); err != nil {
-		return domain.JobSpec{}, err
-	}
-	if err := domain.ValidateSubtitleFormat(spec.Model, spec.Format); err != nil {
-		return domain.JobSpec{}, err
-	}
-	if err := domain.ValidateLogprobs(spec.Model, spec.Logprobs); err != nil {
-		return domain.JobSpec{}, err
-	}
-	if spec.Stdout && spec.EventsMode == domain.EventsJSONL {
-		return domain.JobSpec{}, domain.NewError("stdout_events_conflict", "--stdout cannot be used with --events jsonl", domain.ExitArgs, nil)
-	}
-	if spec.Resume && spec.Stdout {
-		return domain.JobSpec{}, domain.NewError("resume_stdout_conflict", "--resume cannot be used with --stdout", domain.ExitArgs, nil)
-	}
-	if spec.Resume && spec.DryRun {
-		return domain.JobSpec{}, domain.NewError("resume_dry_run_conflict", "--resume cannot be used with --dry-run", domain.ExitArgs, nil)
-	}
-	if spec.Resume && !spec.WriteManifest {
-		return domain.JobSpec{}, domain.NewError("resume_manifest_required", "--resume requires --write-manifest", domain.ExitArgs, nil)
-	}
-	if spec.PartialOutput == domain.PartialStdout && !spec.Stdout {
-		return domain.JobSpec{}, domain.NewError("partial_stdout_requires_stdout", "--partial-output stdout requires --stdout", domain.ExitArgs, nil)
-	}
-	if spec.Parallel && !supportsManualParallel(spec.Model) {
-		return domain.JobSpec{}, domain.NewError("parallel_model_not_supported", "--parallel is supported only with gpt-4o-transcribe and gpt-4o-mini-transcribe", domain.ExitArgs, nil)
-	}
-	if err := domain.ValidatePrompt(spec.Model, spec.Prompt); err != nil {
-		return domain.JobSpec{}, err
-	}
-
-	if spec.StartSec, err = parseOptionalTime(getString(cmd, "start")); err != nil {
-		return domain.JobSpec{}, domain.NewError("start_invalid", "invalid --start value", domain.ExitArgs, err)
-	}
-	if spec.EndSec, err = parseOptionalTime(getString(cmd, "end")); err != nil {
-		return domain.JobSpec{}, domain.NewError("end_invalid", "invalid --end value", domain.ExitArgs, err)
-	}
-	if spec.StartSec != nil && spec.EndSec != nil && *spec.EndSec <= *spec.StartSec {
-		return domain.JobSpec{}, domain.NewError("time_range_invalid", "--end must be greater than --start", domain.ExitArgs, nil)
-	}
-	return spec, nil
+		ChunkTargetSec:                    floatPtrIfChanged(cmd, "chunk-target-sec"),
+		ChunkOverlapSec:                   floatPtrIfChanged(cmd, "chunk-overlap-sec"),
+		ServerVADThreshold:                getFloat(cmd, "server-vad-threshold"),
+		ServerVADPrefixMS:                 getInt(cmd, "server-vad-prefix-ms"),
+		ServerVADSilenceMS:                getInt(cmd, "server-vad-silence-ms"),
+		ObsidianVADMode:                   getString(cmd, "obsidian-vad-mode"),
+		SpeakerRefs:                       getStringArray(cmd, "speaker-ref"),
+	}, specbuilder.Defaults{
+		Config: cfg,
+		CWD:    cwd,
+		Env: map[string]string{
+			"TRANSCRIBER_FFMPEG":  os.Getenv("TRANSCRIBER_FFMPEG"),
+			"TRANSCRIBER_FFPROBE": os.Getenv("TRANSCRIBER_FFPROBE"),
+		},
+		JobID: app.GenerateJobID(),
+	})
 }
 
-func supportsManualParallel(model string) bool {
-	switch model {
-	case "gpt-4o-transcribe", "gpt-4o-mini-transcribe":
-		return true
-	default:
-		return false
-	}
-}
-
-func buildServices(spec domain.JobSpec) (*app.Services, context.Context, context.CancelFunc, error) {
-	level, err := logging.ParseLevel(spec.Quiet, spec.Verbose)
+func buildServices(spec domain.JobSpec, apiKey string) (*app.Services, context.Context, context.CancelFunc, error) {
+	services, err := buildCoreServices(spec, apiKey, os.Stdout, os.Stderr)
 	if err != nil {
 		return nil, nil, nil, err
+	}
+	ctx, cancel := signalAwareContext(spec.Timeout)
+	return services, ctx, cancel, nil
+}
+
+func buildCoreServices(spec domain.JobSpec, apiKey string, stdout, stderr io.Writer) (*app.Services, error) {
+	level, err := logging.ParseLevel(spec.Quiet, spec.Verbose)
+	if err != nil {
+		return nil, err
 	}
 	if !spec.Quiet && !spec.Verbose {
 		level = parseLogLevelEnv(level)
 	}
 
-	logger := logging.New(os.Stderr, level, spec.LogFormat)
+	logger := logging.New(stderr, level, spec.LogFormat)
 	var eventWriter events.Writer
 	switch spec.EventsMode {
 	case domain.EventsJSONL:
-		eventWriter = events.NewJSONLWriter(os.Stdout, spec.JobID)
+		eventWriter = events.NewJSONLWriter(stdout, spec.JobID)
 	case domain.EventsText:
-		eventWriter = events.NewTextWriter(os.Stderr)
+		eventWriter = events.NewTextWriter(stderr)
 	default:
 		eventWriter = events.NopWriter{}
 	}
 
+	var provider app.Provider
+	if strings.TrimSpace(apiKey) != "" {
+		provider = openaip.New(apiKey)
+	}
+	services := app.New(media.NewService(), plan.NewPlanner(), provider, vad.NewService(), postprocess.NewService(apiKey), logger, eventWriter)
+	return services, nil
+}
+
+func resolveAPIKey(cfg config.AppConfig) (keystore.ResolveResult, error) {
+	return defaultKeyResolver().ResolveAPIKey(cfg)
+}
+
+func defaultKeyResolver() keystore.Resolver {
+	return keystore.Resolver{
+		Env:      keystore.OSEnv{},
+		Keychain: keystore.SystemKeychain{},
+		Files:    keystore.DefaultFileStore{},
+	}
+}
+
+func signalAwareContext(timeout time.Duration) (context.Context, context.CancelFunc) {
 	baseCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	ctx, timeoutCancel := openaip.MustTimeout(baseCtx, spec.Timeout)
+	ctx, timeoutCancel := openaip.MustTimeout(baseCtx, timeout)
 	secondSignal := make(chan os.Signal, 1)
 	signal.Notify(secondSignal, os.Interrupt, syscall.SIGTERM)
 	done := make(chan struct{})
@@ -656,67 +693,7 @@ func buildServices(spec domain.JobSpec) (*app.Services, context.Context, context
 		timeoutCancel()
 		stopSignals()
 	}
-
-	apiKey := os.Getenv(valueOr(spec.APIKeyEnv, "OPENAI_API_KEY"))
-	var provider app.Provider
-	if strings.TrimSpace(apiKey) != "" {
-		provider = openaip.New(apiKey)
-	}
-	services := app.New(media.NewService(), plan.NewPlanner(), provider, vad.NewService(), postprocess.NewService(apiKey), logger, eventWriter)
-	return services, ctx, cancel, nil
-}
-
-func parseOptionalTime(value string) (*float64, error) {
-	if strings.TrimSpace(value) == "" {
-		return nil, nil
-	}
-	if strings.Contains(value, ":") {
-		parts := strings.Split(value, ":")
-		var total float64
-		for _, part := range parts {
-			n, err := strconv.ParseFloat(part, 64)
-			if err != nil {
-				return nil, err
-			}
-			total = total*60 + n
-		}
-		return &total, nil
-	}
-	n, err := strconv.ParseFloat(value, 64)
-	if err != nil {
-		return nil, err
-	}
-	return &n, nil
-}
-
-func parseFormat(v string) domain.OutputFormat       { return domain.OutputFormat(v) }
-func parseChunking(v string) domain.ChunkingMode     { return domain.ChunkingMode(v) }
-func parseVAD(v string) domain.VADMode               { return domain.VADMode(v) }
-func parseEvents(v string) domain.EventsMode         { return domain.EventsMode(v) }
-func parseLogFormat(v string) domain.LogFormat       { return domain.LogFormat(v) }
-func parsePartial(v string) domain.PartialOutputMode { return domain.PartialOutputMode(v) }
-
-func parseSpeakerRefs(values []string) ([]domain.SpeakerReference, error) {
-	refs := make([]domain.SpeakerReference, 0, len(values))
-	for _, value := range values {
-		name, path, found := strings.Cut(value, "=")
-		if !found {
-			return nil, domain.NewError("speaker_ref_invalid", "speaker references must use name=path form", domain.ExitArgs, nil)
-		}
-		name = strings.TrimSpace(name)
-		path = strings.TrimSpace(path)
-		if name == "" || path == "" {
-			return nil, domain.NewError("speaker_ref_invalid", "speaker references must include both name and path", domain.ExitArgs, nil)
-		}
-		absPath, err := filepath.Abs(path)
-		if err != nil {
-			return nil, domain.NewError("speaker_ref_invalid", "failed to resolve speaker reference path", domain.ExitArgs, err)
-		}
-		// Resolve speaker references at the CLI boundary so provider validation and
-		// manifest data never have to guess which file the user intended.
-		refs = append(refs, domain.SpeakerReference{Name: name, Path: absPath})
-	}
-	return refs, nil
+	return ctx, cancel
 }
 
 func valueOr(value, fallback string) string {
@@ -726,32 +703,34 @@ func valueOr(value, fallback string) string {
 	return fallback
 }
 
-func envOr(name, fallback string) string {
-	if value := os.Getenv(name); value != "" {
-		return value
+func keyValueForSet(cfg config.AppConfig, flagValue string, stdin bool, input io.Reader) (string, error) {
+	if stdin {
+		if input == nil {
+			input = os.Stdin
+		}
+		data, err := io.ReadAll(input)
+		if err != nil {
+			return "", domain.NewError("api_key_read_failed", "failed to read API key from stdin", domain.ExitConfig, err)
+		}
+		value := strings.TrimSpace(string(data))
+		if value == "" {
+			return "", domain.NewError("api_key_empty", "API key is empty", domain.ExitArgs, nil)
+		}
+		return value, nil
 	}
-	return fallback
-}
-
-func boolValue(cmd *cobra.Command, name string, fallback bool) bool {
-	if cmd.Flags().Changed(name) {
-		return getBool(cmd, name)
+	if strings.TrimSpace(flagValue) != "" {
+		return strings.TrimSpace(flagValue), nil
 	}
-	return fallback
-}
-
-func firstFloat(value, fallback float64) float64 {
-	if value != 0 {
-		return value
+	envName := valueOr(cfg.API.KeyEnv, "OPENAI_API_KEY")
+	if value := strings.TrimSpace(os.Getenv(envName)); value != "" {
+		return value, nil
 	}
-	return fallback
-}
-
-func firstInt(value, fallback int) int {
-	if value != 0 {
-		return value
+	if envName != "OPENAI_API_KEY" {
+		if value := strings.TrimSpace(os.Getenv("OPENAI_API_KEY")); value != "" {
+			return value, nil
+		}
 	}
-	return fallback
+	return "", domain.NewError("api_key_empty", "provide --value, --stdin, or an API key environment variable", domain.ExitArgs, nil)
 }
 
 func getString(cmd *cobra.Command, name string) string { v, _ := cmd.Flags().GetString(name); return v }
@@ -768,6 +747,22 @@ func getFloat(cmd *cobra.Command, name string) float64 {
 func getDuration(cmd *cobra.Command, name string) time.Duration {
 	v, _ := cmd.Flags().GetDuration(name)
 	return v
+}
+
+func boolPtrIfChanged(cmd *cobra.Command, name string) *bool {
+	if !cmd.Flags().Changed(name) {
+		return nil
+	}
+	value := getBool(cmd, name)
+	return &value
+}
+
+func floatPtrIfChanged(cmd *cobra.Command, name string) *float64 {
+	if !cmd.Flags().Changed(name) {
+		return nil
+	}
+	value := getFloat(cmd, name)
+	return &value
 }
 
 func parseLogLevelEnv(fallback logging.Level) logging.Level {

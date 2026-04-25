@@ -46,7 +46,7 @@ cd "$repo_root"
 module_path=$("$go_bin" list -m)
 base_version=$(awk -F'"' '/Version = / { print $2; exit }' internal/buildinfo/buildinfo.go)
 if [ -z "$base_version" ]; then
-	base_version=0.3.0
+	base_version=0.4.0
 fi
 
 version=${VERSION:-}

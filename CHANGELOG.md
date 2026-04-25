@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## v0.4.0
+
+- Add an interactive Bubble Tea TUI for one-off local transcription jobs.
+- Add API key management commands with macOS Keychain support and local key-file fallback.
+- Use one API key resolution order across CLI, pipeline, doctor, and TUI flows.
+- Refactor CLI spec building into a shared tested package used by CLI and TUI.
+- Improve TUI option editing, selection controls, output-path hints, and API key configuration screens.
+- Expand gitignore coverage for generated transcripts, local configs, scratch data, and private agent notes.
+
 ## v0.3.0
 
 - Add `--parallel` client-chunk sending for `gpt-4o-transcribe` and `gpt-4o-mini-transcribe`.

@@ -10,6 +10,7 @@ This document is the complete reference for `config.toml`, related environment v
 - precedence: `flags > env > explicit config > default config > internal defaults`
 - API keys are not stored in `config.toml`
 - the default API key environment variable name is `OPENAI_API_KEY`
+- API key resolution order is `[api].key_env`, `OPENAI_API_KEY`, OS keychain, optional local key file
 - `transcriber config init` prints a current sample config
 - `transcriber config validate` checks a config file against runtime rules
 
@@ -27,9 +28,11 @@ You can override the path with:
 
 These variables are read by the binary directly:
 
+- the environment variable named by `[api].key_env`
+  - default: `OPENAI_API_KEY`
+  - takes precedence when it names a custom variable and that variable is set
 - `OPENAI_API_KEY`
-  - default API key source
-  - actual variable name can be changed through `[api].key_env`
+  - standard fallback when `[api].key_env` names a different unset variable
 - `TRANSCRIBER_CONFIG`
   - config file path override
 - `TRANSCRIBER_FFMPEG`
@@ -38,6 +41,31 @@ These variables are read by the binary directly:
   - fallback override for the ffprobe executable path
 - `TRANSCRIBER_LOG_LEVEL`
   - log level override used by the CLI runtime
+
+## Stored API Keys
+
+Use the key helper commands to inspect or manage stored API keys:
+
+```sh
+transcriber config key status
+printf '%s' "$OPENAI_API_KEY" | transcriber config key set --method keychain --stdin
+transcriber config key delete --method keychain
+```
+
+Supported storage methods:
+
+- `keychain`
+  - macOS Keychain via the native Security framework
+  - unavailable platforms fall back to env or file resolution
+- `file`
+  - local key file next to the default config path
+
+When no API key environment variable is set, the runtime also checks a local key file named `key.txt` next to the default config path:
+
+- macOS / Linux: `~/.config/transcriber/key.txt`
+- Windows: `%AppData%/transcriber/key.txt`
+
+Environment variables always override stored keys. Keychain storage is checked before the file. The key file is written with user-only permissions when the runtime creates it.
 
 ## Full `config.toml` Sample
 

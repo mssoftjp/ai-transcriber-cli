@@ -5,8 +5,8 @@ usage() {
   echo "Usage: $0 <version>"
   echo ""
   echo "Examples:"
-  echo "  $0 v0.3.0"
-  echo "  $0 v0.3.0-rc.1"
+  echo "  $0 v0.4.0"
+  echo "  $0 v0.4.0-rc.1"
   exit 1
 }
 

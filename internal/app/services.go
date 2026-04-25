@@ -110,7 +110,7 @@ func unsupportedReason(supported bool, reason string) string {
 	return reason
 }
 
-func (s *Services) Doctor(ctx context.Context, spec domain.JobSpec, apiKey string) (domain.DoctorResult, error) {
+func (s *Services) Doctor(ctx context.Context, spec domain.JobSpec, apiKey string, apiKeySource string) (domain.DoctorResult, error) {
 	var checks []domain.DoctorCheck
 	checks = append(checks, checkExec(spec.FFmpegPath, "ffmpeg"))
 	checks = append(checks, checkExec(spec.FFprobePath, "ffprobe"))
@@ -127,7 +127,10 @@ func (s *Services) Doctor(ctx context.Context, spec domain.JobSpec, apiKey strin
 			Code:    "missing_api_key",
 		})
 	} else {
-		checks = append(checks, domain.DoctorCheck{Name: "openai_api_key", OK: true, Message: fmt.Sprintf("API key found in %s", apiKeyEnv)})
+		if strings.TrimSpace(apiKeySource) == "" {
+			apiKeySource = apiKeyEnv
+		}
+		checks = append(checks, domain.DoctorCheck{Name: "openai_api_key", OK: true, Message: fmt.Sprintf("API key found via %s", apiKeySource)})
 		if s.Provider == nil {
 			checks = append(checks, domain.DoctorCheck{Name: "provider_connectivity", OK: false, Message: "provider is not configured", Code: "missing_api_key"})
 		} else if err := s.Provider.CheckConnectivity(ctx); err != nil {
